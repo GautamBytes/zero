@@ -40,7 +40,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 		result.Turns = turn + 1
 		request := zeroruntime.CompletionRequest{
 			Messages: copyMessages(messages),
-			Tools:    toolDefinitions(registry, permissionMode),
+			Tools:    toolDefinitions(registry, permissionMode, options),
 		}
 
 		stream, err := provider.StreamCompletion(ctx, request)
@@ -78,7 +78,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 			if options.OnToolCall != nil {
 				options.OnToolCall(call)
 			}
-			toolResult := executeToolCall(ctx, registry, call, permissionMode)
+			toolResult := executeToolCall(ctx, registry, call, permissionMode, options)
 			if options.OnToolResult != nil {
 				options.OnToolResult(toolResult)
 			}
@@ -95,7 +95,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 	return result, nil
 }
 
-func executeToolCall(ctx context.Context, registry *tools.Registry, call ToolCall, permissionMode PermissionMode) ToolResult {
+func executeToolCall(ctx context.Context, registry *tools.Registry, call ToolCall, permissionMode PermissionMode, options Options) ToolResult {
 	args := map[string]any{}
 	if call.Arguments != "" {
 		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
@@ -105,6 +105,14 @@ func executeToolCall(ctx context.Context, registry *tools.Registry, call ToolCal
 				Status:     tools.StatusError,
 				Output:     "Error: Failed to parse arguments for " + call.Name + ": " + err.Error(),
 			}
+		}
+	}
+	if !ToolAllowedByFilters(call.Name, options.EnabledTools, options.DisabledTools) {
+		return ToolResult{
+			ToolCallID: call.ID,
+			Name:       call.Name,
+			Status:     tools.StatusError,
+			Output:     `Error: Tool "` + call.Name + `" is not enabled for this run.`,
 		}
 	}
 
@@ -124,11 +132,11 @@ func executeToolCall(ctx context.Context, registry *tools.Registry, call ToolCal
 	}
 }
 
-func toolDefinitions(registry *tools.Registry, permissionMode PermissionMode) []zeroruntime.ToolDefinition {
+func toolDefinitions(registry *tools.Registry, permissionMode PermissionMode, options Options) []zeroruntime.ToolDefinition {
 	registeredTools := registry.All()
 	definitions := make([]zeroruntime.ToolDefinition, 0, len(registeredTools))
 	for _, tool := range registeredTools {
-		if !isAdvertised(tool, permissionMode) {
+		if !ToolVisible(tool, permissionMode, options.EnabledTools, options.DisabledTools) {
 			continue
 		}
 		definitions = append(definitions, zeroruntime.ToolDefinition{
@@ -142,6 +150,31 @@ func toolDefinitions(registry *tools.Registry, permissionMode PermissionMode) []
 		return definitions[left].Name < definitions[right].Name
 	})
 	return definitions
+}
+
+func ToolVisible(tool tools.Tool, permissionMode PermissionMode, enabledTools []string, disabledTools []string) bool {
+	return ToolAllowedByFilters(tool.Name(), enabledTools, disabledTools) && ToolAdvertised(tool, permissionMode)
+}
+
+func ToolAllowedByFilters(name string, enabledTools []string, disabledTools []string) bool {
+	if len(enabledTools) > 0 {
+		if !containsToolName(enabledTools, name) {
+			return false
+		}
+	}
+	if containsToolName(disabledTools, name) {
+		return false
+	}
+	return true
+}
+
+func containsToolName(names []string, name string) bool {
+	for _, candidate := range names {
+		if candidate == name {
+			return true
+		}
+	}
+	return false
 }
 
 func schemaToRuntimeMap(schema tools.Schema) map[string]any {
@@ -187,7 +220,7 @@ func propertyToRuntimeMap(property tools.PropertySchema) map[string]any {
 	return schema
 }
 
-func isAdvertised(tool tools.Tool, permissionMode PermissionMode) bool {
+func ToolAdvertised(tool tools.Tool, permissionMode PermissionMode) bool {
 	if tool.Safety().Permission == tools.PermissionDeny {
 		return false
 	}

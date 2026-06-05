@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -103,6 +104,11 @@ func TestStoreForkCopiesEventsAndLineage(t *testing.T) {
 	}
 	if len(events) != 3 || events[0].ID != "fork:1" || events[2].Type != EventSessionFork {
 		t.Fatalf("fork events not copied/remapped: %#v", events)
+	}
+	got := []EventType{events[0].Type, events[1].Type, events[2].Type}
+	want := []EventType{EventMessage, EventMessage, EventSessionFork}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("fork event types = %#v, want %#v", got, want)
 	}
 }
 
@@ -214,10 +220,77 @@ func TestStoreAppendEventSerializesConcurrentWriters(t *testing.T) {
 	}
 }
 
+func TestPrepareExecSessionResolvesResumeAndFork(t *testing.T) {
+	store := NewStore(StoreOptions{
+		RootDir: t.TempDir(),
+		Now: sequenceClock([]time.Time{
+			time.Date(2026, 6, 4, 10, 0, 0, 0, time.UTC),
+			time.Date(2026, 6, 4, 10, 0, 1, 0, time.UTC),
+			time.Date(2026, 6, 4, 10, 0, 2, 0, time.UTC),
+			time.Date(2026, 6, 4, 10, 0, 3, 0, time.UTC),
+		}),
+	})
+	if _, err := store.Create(CreateInput{SessionID: "older"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(CreateInput{SessionID: "latest", Title: "Latest"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendEvent("latest", AppendEventInput{Type: EventMessage, Payload: map[string]any{"content": "previous answer"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := PrepareExec(PrepareExecOptions{Store: store, ResumeLatest: true})
+	if err != nil {
+		t.Fatalf("PrepareExec returned error: %v", err)
+	}
+	if prepared.Mode != ModeResume || prepared.Session.SessionID != "latest" || len(prepared.ContextEvents) != 1 {
+		t.Fatalf("prepared resume = %#v", prepared)
+	}
+	if got := FormatExecPrompt("continue", prepared); got == "continue" || !strings.Contains(got, "previous answer") {
+		t.Fatalf("expected session context in prompt, got %q", got)
+	}
+
+	forked, err := PrepareExec(PrepareExecOptions{Store: store, Fork: "latest", SessionID: "forked"})
+	if err != nil {
+		t.Fatalf("PrepareExec fork returned error: %v", err)
+	}
+	if forked.Mode != ModeFork || forked.Session.ParentSessionID != "latest" {
+		t.Fatalf("prepared fork = %#v", forked)
+	}
+}
+
+func TestPrepareExecWhitespaceResumeDoesNotFallbackToLatest(t *testing.T) {
+	store := NewStore(StoreOptions{RootDir: t.TempDir(), Now: fixedClock("2026-06-04T14:00:00Z")})
+	if _, err := store.Create(CreateInput{SessionID: "latest"}); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := PrepareExec(PrepareExecOptions{Store: store, Resume: "   ", SessionID: "new_session"})
+	if err != nil {
+		t.Fatalf("PrepareExec returned error: %v", err)
+	}
+	if prepared.Mode != ModeNew || prepared.Session.SessionID != "new_session" {
+		t.Fatalf("expected whitespace resume to create a new session, got %#v", prepared)
+	}
+}
+
 func fixedClock(value string) func() time.Time {
 	parsed, err := time.Parse(time.RFC3339, value)
 	if err != nil {
 		panic(err)
 	}
 	return func() time.Time { return parsed }
+}
+
+func sequenceClock(values []time.Time) func() time.Time {
+	index := 0
+	return func() time.Time {
+		if index >= len(values) {
+			return values[len(values)-1]
+		}
+		value := values[index]
+		index++
+		return value
+	}
 }
