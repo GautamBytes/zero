@@ -85,6 +85,10 @@ type model struct {
 	// row. Active only when suggestionsActive() (no modal, non-empty matches).
 	suggestions   []commandSuggestion
 	suggestionIdx int
+	// suggestionsAreFiles is true when the overlay is showing "@file" matches
+	// rather than "/command" matches, so completion inserts a path token instead
+	// of replacing the whole input.
+	suggestionsAreFiles bool
 
 	// picker, when non-nil, is an open interactive selector overlay (/model,
 	// /theme, /effort, /mode with no argument). It captures ↑/↓/Enter/Esc and
@@ -482,6 +486,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.transcript = appendTranscriptRow(m.transcript, msg.row)
 		return m, nil
+	case bashResultMsg:
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: msg.output})
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -850,6 +857,26 @@ func (m model) handleSubmit() (tea.Model, tea.Cmd) {
 			text: "unknown command: " + command.text,
 		})
 		return m, nil
+	case commandBash:
+		m.showSplash = false
+		cmdText := strings.TrimSpace(command.text)
+		if cmdText == "" {
+			m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: "Usage: !<shell command>"})
+			return m, nil
+		}
+		// A "!cmd" shell escape runs OUTSIDE the agent sandbox, so gate it behind
+		// the explicit unsafe permission mode. In auto/ask mode it is not executed;
+		// the user is told how to enable it. This keeps a sandbox-bypassing exec
+		// from running without a deliberate safety posture.
+		if m.permissionMode != agent.PermissionModeUnsafe {
+			m.transcript = reduceTranscript(m.transcript, transcriptAction{
+				kind: actionAppendSystem,
+				text: "Shell escape (!) is disabled in " + string(m.permissionMode) + " mode — it bypasses the sandbox. Relaunch with --skip-permissions-unsafe to run shell commands directly.",
+			})
+			return m, nil
+		}
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: "$ " + cmdText})
+		return m, runBashEscape(m.cwd, cmdText)
 	case commandPrompt:
 		m.showSplash = false
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendUser, text: command.text})
