@@ -14,6 +14,7 @@ import (
 )
 
 const maxTurnsAnswer = "Agent reached maximum number of turns without a final answer."
+const maxTurnsFinalAnswerPrompt = "You have reached the tool-turn limit. Do not call tools. Give a concise final answer now: summarize what you completed, what you found, and any remaining blockers."
 
 const (
 	toolResultMetaControl       = "control"
@@ -197,7 +198,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 		messages = append(messages, zeroruntime.Message{
 			Role:      zeroruntime.MessageRoleAssistant,
 			Content:   collected.Text,
-			ToolCalls: collected.ToolCalls,
+			ToolCalls: historySafeToolCalls(collected.ToolCalls),
 		})
 
 		if len(collected.ToolCalls) == 0 {
@@ -359,6 +360,11 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 				Role:    zeroruntime.MessageRoleUser,
 				Content: failureHint,
 			})
+		} else if reminder := guards.progressReminder(); reminder != "" {
+			messages = append(messages, zeroruntime.Message{
+				Role:    zeroruntime.MessageRoleUser,
+				Content: reminder,
+			})
 		} else if reminder := guards.planReminder(result.Turns); reminder != "" {
 			messages = append(messages, zeroruntime.Message{
 				Role:    zeroruntime.MessageRoleUser,
@@ -367,9 +373,60 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 		}
 	}
 
+	if ctx.Err() != nil {
+		result.Messages = copyMessages(messages)
+		return result, ctx.Err()
+	}
+	if answer, finalMessages := finalAnswerAfterMaxTurns(ctx, provider, messages, options); strings.TrimSpace(answer) != "" {
+		result.FinalAnswer = answer
+		result.Messages = copyMessages(finalMessages)
+		return result, nil
+	}
+
 	result.FinalAnswer = maxTurnsAnswer
 	result.Messages = copyMessages(messages)
 	return result, nil
+}
+
+func finalAnswerAfterMaxTurns(ctx context.Context, provider Provider, messages []zeroruntime.Message, options Options) (string, []zeroruntime.Message) {
+	finalMessages := copyMessages(messages)
+	finalMessages = append(finalMessages, zeroruntime.Message{
+		Role:    zeroruntime.MessageRoleUser,
+		Content: maxTurnsFinalAnswerPrompt,
+	})
+	stream, err := provider.StreamCompletion(ctx, zeroruntime.CompletionRequest{
+		Messages: copyMessages(finalMessages),
+	})
+	if err != nil {
+		return "", messages
+	}
+	collected := zeroruntime.CollectStreamWithOptions(ctx, stream, zeroruntime.CollectOptions{
+		OnText:  options.OnText,
+		OnUsage: options.OnUsage,
+	})
+	if ctx.Err() != nil || collected.Error != "" || strings.TrimSpace(collected.Text) == "" {
+		return "", messages
+	}
+	finalMessages = append(finalMessages, zeroruntime.Message{
+		Role:    zeroruntime.MessageRoleAssistant,
+		Content: collected.Text,
+	})
+	return collected.Text, finalMessages
+}
+
+func historySafeToolCalls(calls []ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	safe := make([]ToolCall, len(calls))
+	for i, call := range calls {
+		safe[i] = call
+		args := strings.TrimSpace(call.Arguments)
+		if args == "" || !json.Valid([]byte(args)) {
+			safe[i].Arguments = "{}"
+		}
+	}
+	return safe
 }
 
 // toolSchemaJSON renders a tool's parameter schema as readable JSON for the

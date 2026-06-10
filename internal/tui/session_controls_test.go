@@ -145,13 +145,13 @@ func TestUsageEventsUpdateFooterAndContext(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected prompt to start agent run")
 	}
-	updated, _ = next.Update(cmd())
+	updated, _ = next.Update(execCmd(cmd))
 	next = updated.(model)
 
-	footer := next.footerText()
-	for _, want := range []string{"ready", "gpt-4.1", "120 tokens", "$"} {
-		if !strings.Contains(footer, want) {
-			t.Fatalf("expected footer to contain %q, got %q", want, footer)
+	usageText := next.usageSummaryText()
+	for _, want := range []string{"120 tokens", "$"} {
+		if !strings.Contains(usageText, want) {
+			t.Fatalf("expected usage summary to contain %q, got %q", want, usageText)
 		}
 	}
 
@@ -194,15 +194,15 @@ func TestUsageEventsForwardExistingAgentCallback(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected prompt to start agent run")
 	}
-	msg := cmd()
+	msg := execCmd(cmd)
 	if len(seen) != 1 || seen[0].TotalTokens() != 15 {
 		t.Fatalf("expected original usage callback to receive event, got %#v", seen)
 	}
 	updated, _ = next.Update(msg)
 	next = updated.(model)
 
-	if !strings.Contains(next.footerText(), "15 tokens") {
-		t.Fatalf("expected usage to still update footer, got %q", next.footerText())
+	if !strings.Contains(next.usageSummaryText(), "15 tokens") {
+		t.Fatalf("expected usage to still be tracked, got %q", next.usageSummaryText())
 	}
 }
 
@@ -225,13 +225,13 @@ func TestUsageEventsForCustomModelUseTokenOnlyFallback(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected prompt to start agent run")
 	}
-	updated, _ = next.Update(cmd())
+	updated, _ = next.Update(execCmd(cmd))
 	next = updated.(model)
 
-	footer := next.footerText()
-	for _, want := range []string{"custom-coder", "1 request, 120 tokens", "cost unavailable"} {
-		if !strings.Contains(footer, want) {
-			t.Fatalf("expected footer to contain %q, got %q", want, footer)
+	usageText := next.usageSummaryText()
+	for _, want := range []string{"1 request, 120 tokens", "cost unavailable"} {
+		if !strings.Contains(usageText, want) {
+			t.Fatalf("expected usage summary to contain %q, got %q", want, usageText)
 		}
 	}
 	if transcriptContains(next.transcript, "usage:") {
@@ -258,14 +258,14 @@ func TestInvalidUsageEventsAppendTranscriptError(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected prompt to start agent run")
 	}
-	updated, _ = next.Update(cmd())
+	updated, _ = next.Update(execCmd(cmd))
 	next = updated.(model)
 
 	if !transcriptContains(next.transcript, "usage: expected inputTokens to be non-negative") {
 		t.Fatalf("expected invalid usage transcript error, got %#v", next.transcript)
 	}
-	if next.unpricedRequests != 0 || strings.Contains(next.footerText(), "cost unavailable") {
-		t.Fatalf("invalid usage should not be counted as unpriced, requests=%d footer=%q", next.unpricedRequests, next.footerText())
+	if next.unpricedRequests != 0 || strings.Contains(next.usageSummaryText(), "cost unavailable") {
+		t.Fatalf("invalid usage should not be counted as unpriced, requests=%d usage=%q", next.unpricedRequests, next.usageSummaryText())
 	}
 }
 
@@ -279,8 +279,8 @@ func TestStaleAgentUsageResponseIsIgnored(t *testing.T) {
 	})
 	next := updated.(model)
 
-	if strings.Contains(next.footerText(), "120 tokens") {
-		t.Fatalf("stale usage response should be ignored, got footer %q", next.footerText())
+	if strings.Contains(next.usageSummaryText(), "120 tokens") {
+		t.Fatalf("stale usage response should be ignored, got %q", next.usageSummaryText())
 	}
 }
 

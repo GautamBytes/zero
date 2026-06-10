@@ -136,6 +136,26 @@ func TestRunResetsEmptyTurnCounterOnToolCall(t *testing.T) {
 	}
 }
 
+func TestGuardStateResetsToolOnlyStreakOnEmptyNonToolTurn(t *testing.T) {
+	var state guardState
+	toolOnly := zeroruntime.CollectedStream{
+		ToolCalls: []zeroruntime.ToolCall{{ID: "call", Name: "read_file", Arguments: `{}`}},
+	}
+
+	for range toolOnlyProgressReminderAt - 1 {
+		state.observeTurn(toolOnly)
+	}
+	state.observeTurn(zeroruntime.CollectedStream{})
+	state.observeTurn(toolOnly)
+
+	if reminder := state.progressReminder(); reminder != "" {
+		t.Fatalf("expected empty non-tool turn to reset tool-only progress reminder, got %q", reminder)
+	}
+	if state.toolOnlyTurns != 1 {
+		t.Fatalf("expected tool-only streak to restart at 1, got %d", state.toolOnlyTurns)
+	}
+}
+
 func TestRunDoesNotCountDroppedToolCallTurnsAsEmpty(t *testing.T) {
 	provider := &mockProvider{
 		turns: [][]zeroruntime.StreamEvent{
@@ -327,6 +347,43 @@ func TestRunStalePlanReminderIsOneShotPerInterval(t *testing.T) {
 	count := countUserMessagesContaining(result.Messages, planStaleReminderMarker)
 	if count != 1 {
 		t.Fatalf("expected the stale reminder to be one-shot per interval (exactly 1), got %d", count)
+	}
+}
+
+func TestRunInjectsToolOnlyProgressReminder(t *testing.T) {
+	root := t.TempDir()
+	writeAgentTestFile(t, root+"/notes.txt", "alpha")
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewReadFileTool(root))
+
+	turns := make([][]zeroruntime.StreamEvent, 0, toolOnlyProgressReminderAt+1)
+	for i := 0; i < toolOnlyProgressReminderAt; i++ {
+		turns = append(turns, toolTurn("call", "read_file", `{"path":"notes.txt"}`))
+	}
+	turns = append(turns, textTurn("done"))
+
+	provider := &mockProvider{turns: turns}
+	result, err := Run(context.Background(), "go", provider, Options{
+		Registry: registry,
+		MaxTurns: len(turns) + 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalAnswer != "done" {
+		t.Fatalf("expected final answer, got %q", result.FinalAnswer)
+	}
+	if count := countUserMessagesContaining(result.Messages, toolOnlyProgressReminderMarker); count != 1 {
+		t.Fatalf("expected one tool-only progress reminder, got %d", count)
+	}
+	found := false
+	for _, message := range provider.requests[toolOnlyProgressReminderAt].Messages {
+		if message.Role == zeroruntime.MessageRoleUser && strings.Contains(message.Content, toolOnlyProgressReminderMarker) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected reminder on request after tool-only streak, messages: %+v", provider.requests[toolOnlyProgressReminderAt].Messages)
 	}
 }
 

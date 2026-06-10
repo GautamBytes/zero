@@ -4,7 +4,9 @@ import (
 	_ "embed"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Gitlawb/zero/internal/repomap"
 )
@@ -77,6 +79,12 @@ func workspaceContext(cwd string) string {
 	var b strings.Builder
 	b.WriteString("<environment>\n")
 	b.WriteString("Working directory: " + cwd + "\n")
+	b.WriteString("Operating system: " + runtime.GOOS + "\n")
+	if runtime.GOOS == "windows" {
+		b.WriteString("Shell syntax: Windows cmd.exe syntax for bash tool; prefer the cwd argument instead of cd when changing directories.\n")
+	} else {
+		b.WriteString("Shell syntax: /bin/sh syntax for bash tool; prefer the cwd argument instead of cd when changing directories.\n")
+	}
 	if branch := gitBranchForPrompt(cwd); branch != "" {
 		b.WriteString("Git branch: " + branch + "\n")
 	}
@@ -92,7 +100,11 @@ func workspaceContext(cwd string) string {
 			continue
 		}
 		if len(content) > maxProjectContextBytes {
-			content = content[:maxProjectContextBytes] + "\n… (truncated)"
+			cut := maxProjectContextBytes
+			for cut > 0 && !utf8.RuneStart(content[cut]) {
+				cut--
+			}
+			content = content[:cut] + "\n… (truncated)"
 		}
 		b.WriteString("\n\n## Project guidelines (" + name + ")\n\n" + content)
 		break // first match wins

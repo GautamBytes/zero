@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -361,6 +362,64 @@ func TestRunExecutesToolCallThroughRegistry(t *testing.T) {
 	}
 	if len(toolResults) != 1 || toolResults[0].Status != tools.StatusOK {
 		t.Fatalf("expected one ok tool result, got %#v", toolResults)
+	}
+}
+
+func TestRunSanitizesMalformedToolCallArgumentsBeforeRetry(t *testing.T) {
+	root := t.TempDir()
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewReadFileTool(root))
+	provider := &mockProvider{
+		turns: [][]zeroruntime.StreamEvent{
+			{
+				{Type: zeroruntime.StreamEventToolCallStart, ToolCallID: "call-1", ToolName: "read_file"},
+				{Type: zeroruntime.StreamEventToolCallDelta, ToolCallID: "call-1", ArgumentsFragment: `{"path":"README.md"}{"path":"AGENTS.md"}`},
+				{Type: zeroruntime.StreamEventToolCallEnd, ToolCallID: "call-1"},
+				{Type: zeroruntime.StreamEventDone},
+			},
+			{
+				{Type: zeroruntime.StreamEventText, Content: "recovered"},
+				{Type: zeroruntime.StreamEventDone},
+			},
+		},
+	}
+
+	result, err := Run(context.Background(), "read files", provider, Options{
+		Registry: registry,
+		MaxTurns: 2,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalAnswer != "recovered" {
+		t.Fatalf("expected recovery turn final answer, got %q", result.FinalAnswer)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("expected retry request after malformed tool args, got %d requests", len(provider.requests))
+	}
+
+	var assistantCall *zeroruntime.ToolCall
+	var toolParseError string
+	for _, message := range provider.requests[1].Messages {
+		if message.Role == zeroruntime.MessageRoleAssistant && len(message.ToolCalls) > 0 {
+			assistantCall = &message.ToolCalls[0]
+		}
+		if message.Role == zeroruntime.MessageRoleTool && strings.Contains(message.Content, "Failed to parse arguments for read_file") {
+			toolParseError = message.Content
+		}
+	}
+	if assistantCall == nil {
+		t.Fatalf("expected retry request to include assistant tool call history, got %#v", provider.requests[1].Messages)
+	}
+	if !json.Valid([]byte(assistantCall.Arguments)) {
+		t.Fatalf("assistant tool-call arguments must be valid JSON for provider replay, got %q", assistantCall.Arguments)
+	}
+	if assistantCall.Arguments != "{}" {
+		t.Fatalf("malformed arguments should be sanitized to an empty JSON object, got %q", assistantCall.Arguments)
+	}
+	if toolParseError == "" {
+		t.Fatalf("expected model-visible tool result to keep the parse error, messages: %#v", provider.requests[1].Messages)
 	}
 }
 
@@ -745,6 +804,53 @@ func TestRunStopsAfterMaxTurns(t *testing.T) {
 	}
 }
 
+func TestRunRequestsFinalAnswerAfterMaxTurns(t *testing.T) {
+	root := t.TempDir()
+	writeAgentTestFile(t, filepath.Join(root, "notes.txt"), "alpha")
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewReadFileTool(root))
+	provider := &mockProvider{
+		turns: [][]zeroruntime.StreamEvent{
+			{
+				{Type: zeroruntime.StreamEventToolCallStart, ToolCallID: "call-1", ToolName: "read_file"},
+				{Type: zeroruntime.StreamEventToolCallDelta, ToolCallID: "call-1", ArgumentsFragment: `{"path":"notes.txt"}`},
+				{Type: zeroruntime.StreamEventToolCallEnd, ToolCallID: "call-1"},
+				{Type: zeroruntime.StreamEventDone},
+			},
+			{
+				{Type: zeroruntime.StreamEventText, Content: "I read notes.txt and found alpha."},
+				{Type: zeroruntime.StreamEventDone},
+			},
+		},
+	}
+
+	result, err := Run(context.Background(), "loop", provider, Options{
+		Registry: registry,
+		MaxTurns: 1,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalAnswer != "I read notes.txt and found alpha." {
+		t.Fatalf("expected final answer from finalization turn, got %q", result.FinalAnswer)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("expected final no-tools request after max turns, got %d requests", len(provider.requests))
+	}
+	finalRequest := provider.requests[1]
+	if len(finalRequest.Tools) != 0 {
+		t.Fatalf("finalization request must not advertise tools, got %#v", finalRequest.Tools)
+	}
+	lastMessage := finalRequest.Messages[len(finalRequest.Messages)-1]
+	if lastMessage.Role != zeroruntime.MessageRoleUser || !strings.Contains(lastMessage.Content, "tool-turn limit") {
+		t.Fatalf("expected max-turns finalization prompt, got %#v", lastMessage)
+	}
+	if result.Turns != 1 {
+		t.Fatalf("expected tool turns to remain 1, got %d", result.Turns)
+	}
+}
+
 func providerCallingWriteFileThenAnswer(answer string) *mockProvider {
 	return providerCallingWritePathThenAnswer("notes.txt", answer)
 }
@@ -854,6 +960,20 @@ func TestBuildSystemPromptInjectsWorkspaceContext(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "Project guidelines (AGENTS.md)") || !strings.Contains(prompt, "make lint") {
 		t.Fatalf("expected AGENTS.md project guidelines injected, got %q", prompt)
+	}
+}
+
+func TestBuildSystemPromptInjectsHostShellContext(t *testing.T) {
+	prompt := buildSystemPrompt(Options{Cwd: t.TempDir()})
+	if !strings.Contains(prompt, "Operating system: "+runtime.GOOS) {
+		t.Fatalf("expected operating system in environment block, got %q", prompt)
+	}
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(prompt, "Windows cmd.exe syntax") || !strings.Contains(prompt, "cwd argument") {
+			t.Fatalf("expected Windows cmd.exe shell guidance in prompt, got %q", prompt)
+		}
+	} else if !strings.Contains(prompt, "/bin/sh syntax") {
+		t.Fatalf("expected POSIX shell guidance in prompt, got %q", prompt)
 	}
 }
 

@@ -2,7 +2,7 @@ package tui
 
 import (
 	"github.com/Gitlawb/zero/internal/modelregistry"
-	"github.com/Gitlawb/zero/internal/zeroline"
+	"github.com/Gitlawb/zero/internal/providercatalog"
 )
 
 // pickerKind identifies which command a picker selection feeds back into.
@@ -10,21 +10,25 @@ type pickerKind int
 
 const (
 	pickerModel pickerKind = iota
-	pickerTheme
 	pickerEffort
 	pickerMode
 )
 
 // pickerItem is one selectable row: Label is shown, Value is passed to the
-// underlying command handler when chosen.
+// underlying command handler when chosen. Meta is the optional right-aligned
+// readout (ctx window · key env); the dot flags mark provider locality for
+// model rows (accent = remote, blue = local).
 type pickerItem struct {
-	Label string
-	Value string
+	Label  string
+	Value  string
+	Meta   string
+	Remote bool
+	Local  bool
 }
 
-// commandPicker is a generic single-select overlay reused by /model, /theme,
-// /effort, and /mode (invoked with no argument). It owns only list state; the
-// chosen value is applied through the existing command handlers.
+// commandPicker is a generic single-select overlay reused by /model, /effort,
+// and /mode (invoked with no argument). It owns only list state; the chosen
+// value is applied through the existing command handlers.
 type commandPicker struct {
 	kind     pickerKind
 	title    string
@@ -66,25 +70,28 @@ func (m model) newModelPicker() *commandPicker {
 		if label == "" {
 			label = entry.ID
 		}
-		items = append(items, pickerItem{Label: label + "  " + entry.ID, Value: entry.ID})
+		item := pickerItem{Label: label + "  " + entry.ID, Value: entry.ID}
+		// Right meta + locality dot come straight from data the registry and
+		// provider catalog already expose; rows without it just omit the meta.
+		if window := entry.ContextLimits.ContextWindow; window > 0 {
+			item.Meta = formatContextWindow(window)
+		}
+		if descriptor, ok := providercatalog.Get(string(entry.Provider)); ok {
+			item.Remote = !descriptor.Local
+			item.Local = descriptor.Local
+			if len(descriptor.AuthEnvVars) > 0 {
+				if item.Meta != "" {
+					item.Meta += " · "
+				}
+				item.Meta += descriptor.AuthEnvVars[0]
+			}
+		}
+		items = append(items, item)
 		if entry.ID == m.modelName {
 			selected = i
 		}
 	}
 	return &commandPicker{kind: pickerModel, title: "select model", items: items, selected: selected}
-}
-
-// newThemePicker lists the zeroline color themes, preselecting the active one.
-func (m model) newThemePicker() *commandPicker {
-	items := make([]pickerItem, 0, len(zeroline.Themes))
-	for _, theme := range zeroline.Themes {
-		items = append(items, pickerItem{Label: theme.Name, Value: theme.Name})
-	}
-	selected := m.themeVariant
-	if selected < 0 || selected >= len(items) {
-		selected = 0
-	}
-	return &commandPicker{kind: pickerTheme, title: "select theme", items: items, selected: selected}
 }
 
 // newEffortPicker lists the reasoning efforts the active model supports plus an

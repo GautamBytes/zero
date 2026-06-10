@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Gitlawb/zero/internal/agent"
@@ -19,6 +20,28 @@ import (
 	"github.com/Gitlawb/zero/internal/tools"
 	"github.com/Gitlawb/zero/internal/zeroruntime"
 )
+
+// execCmd runs a possibly-batched command synchronously and returns the first
+// substantive message. Run starts batch the agent command with the spinner
+// tick, so tests unwrap the batch and skip spinner housekeeping.
+func execCmd(cmd tea.Cmd) tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return msg
+	}
+	for _, sub := range batch {
+		if inner := execCmd(sub); inner != nil {
+			if _, isTick := inner.(spinner.TickMsg); !isTick {
+				return inner
+			}
+		}
+	}
+	return nil
+}
 
 type fakeProvider struct {
 	events []zeroruntime.StreamEvent
@@ -98,8 +121,8 @@ func TestTranscriptReducer(t *testing.T) {
 	transcript := initialTranscript()
 	transcript = reduceTranscript(transcript, transcriptAction{kind: actionAppendUser, text: "hello"})
 	transcript = reduceTranscript(transcript, transcriptAction{kind: actionAppendAssistant, text: "hi"})
-	transcript = reduceTranscript(transcript, transcriptAction{kind: actionAppendToolCall, name: "read_file"})
-	transcript = reduceTranscript(transcript, transcriptAction{kind: actionAppendToolResult, name: "read_file", text: "ok"})
+	transcript = reduceTranscript(transcript, transcriptAction{kind: actionAppendSystem, text: "note"})
+	transcript = reduceTranscript(transcript, transcriptAction{kind: actionAppendError, text: "boom"})
 
 	if len(transcript) != 5 {
 		t.Fatalf("expected welcome plus four rows, got %#v", transcript)
@@ -107,8 +130,8 @@ func TestTranscriptReducer(t *testing.T) {
 	if transcript[1].kind != rowUser || transcript[1].text != "hello" {
 		t.Fatalf("expected user row, got %#v", transcript[1])
 	}
-	if transcript[3].kind != rowToolCall || !strings.Contains(transcript[3].text, "read_file") {
-		t.Fatalf("expected tool-call placeholder, got %#v", transcript[3])
+	if transcript[3].kind != rowSystem || transcript[3].text != "note" {
+		t.Fatalf("expected system row, got %#v", transcript[3])
 	}
 
 	cleared := reduceTranscript(transcript, transcriptAction{kind: actionClear})
@@ -117,7 +140,7 @@ func TestTranscriptReducer(t *testing.T) {
 	}
 }
 
-func TestInitialRenderShowsPremiumStartupSplash(t *testing.T) {
+func TestInitialRenderShowsLimeChatSurface(t *testing.T) {
 	model := newModel(context.Background(), Options{
 		Cwd:          `D:\codings\Opensource\Zero`,
 		ProviderName: "openai",
@@ -127,55 +150,48 @@ func TestInitialRenderShowsPremiumStartupSplash(t *testing.T) {
 	model.height = 34
 
 	view := model.View()
-	assertContains(t, view, "ZERO")
-	assertContains(t, view, `D:\codings\Opensource\Zero`)
-	assertContains(t, view, "project: zero")
-	assertContains(t, view, "READY")
-	assertContains(t, view, "openai / gpt-4.1")
-	assertContains(t, view, "terminal coding agent")
-	assertContains(t, view, "/plan")
-	assertContains(t, view, "/debug")
-	assertContains(t, view, "/tools")
-	assertContains(t, view, "/model")
-	assertContains(t, view, "/provider")
-	assertContains(t, view, "zero > Ask Zero to inspect, edit, explain, or run a command...")
+	assertContains(t, view, " 0 ")
+	assertContains(t, view, "zero")
+	assertContains(t, view, "openai/gpt-4.1")
+	assertContains(t, view, emptyStateTagline)
+	assertContains(t, view, "running zero against ")
+	assertContains(t, view, composerPlaceholderIdle)
+	assertContains(t, view, "interactive")
 	if strings.Contains(view, "Welcome to Zero") {
-		t.Fatalf("startup splash should not show welcome transcript clutter, got %q", view)
-	}
-	if strings.Contains(view, "/clear") || strings.Contains(view, "/exit") {
-		t.Fatalf("startup splash should keep footer minimal, got %q", view)
+		t.Fatalf("empty chat surface should not show welcome transcript clutter, got %q", view)
 	}
 }
 
-func TestStartupSplashCollapsesAfterFirstPrompt(t *testing.T) {
+func TestEmptyStateCollapsesAfterFirstPrompt(t *testing.T) {
 	m := newModel(context.Background(), Options{})
-	m.width = 96
+	m.width = 100
 	m.height = 30
 	m.input.SetValue("inspect the repo")
 
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	next := updated.(model)
 	next.width = m.width
 	next.height = m.height
 
-	if cmd != nil {
+	if next.pending {
 		t.Fatal("expected missing provider prompt not to start an agent run")
 	}
-	view := next.View()
-	assertContains(t, view, "▍ you")
-	assertContains(t, view, "inspect the repo")
-	assertContains(t, view, "◇ zero")
-	assertContains(t, view, "No provider configured.")
-	if strings.Contains(view, "terminal coding agent") {
-		t.Fatalf("startup splash should collapse after first prompt, got %q", view)
+	if !transcriptContains(next.transcript, "inspect the repo") || !transcriptContains(next.transcript, "No provider configured.") {
+		t.Fatalf("expected prompt and notice rows in transcript, got %#v", next.transcript)
 	}
-	// Working view shows the professional status line and live header state
-	// instead of the verbose command-footer hints.
-	assertContains(t, view, "shift+tab to cycle")
-	assertContains(t, view, "● ready")
+	if next.flushed != len(next.transcript) {
+		t.Fatalf("expected settled rows to flush to scrollback, flushed=%d rows=%d", next.flushed, len(next.transcript))
+	}
+	view := next.View()
+	if strings.Contains(view, emptyStateTagline) {
+		t.Fatalf("empty state should collapse after first prompt, got %q", view)
+	}
+	// Working view shows the status-line groups instead of footer hints.
+	assertContains(t, view, "interactive")
+	assertContains(t, view, "⏵⏵ auto-approve")
 }
 
-func TestStartupSplashStaysVisibleOnEmptySubmit(t *testing.T) {
+func TestEmptyStateStaysVisibleOnEmptySubmit(t *testing.T) {
 	m := newModel(context.Background(), Options{})
 	m.width = 96
 	m.height = 30
@@ -187,42 +203,8 @@ func TestStartupSplashStaysVisibleOnEmptySubmit(t *testing.T) {
 	next.height = m.height
 
 	view := next.View()
-	assertContains(t, view, "terminal coding agent")
-	assertNotContains(t, view, "▍ you")
-	assertNotContains(t, view, "◇ zero")
-	assertNotContains(t, view, "● ready")
-}
-
-func TestCommandFooterTextUsesRegistryEntries(t *testing.T) {
-	footer := commandFooterText()
-
-	for _, command := range []string{"/help", "/model", "/provider", "/context", "/compact", "/effort", "/style", "/tools", "/permissions", "/clear", "/exit"} {
-		assertContains(t, footer, command)
-	}
-	assertContains(t, footer, "Esc clear")
-	assertContains(t, footer, "Ctrl+C quit")
-}
-
-func TestCommandFooterTextFallsBackWhenRegistryIsEmpty(t *testing.T) {
-	footer := formatCommandFooterText(nil, false)
-
-	for _, command := range []string{"/help", "/model", "/provider", "/context", "/compact", "/effort", "/style", "/tools", "/permissions", "/clear", "/exit"} {
-		assertContains(t, footer, command)
-	}
-	assertContains(t, footer, "Esc clear")
-	assertContains(t, footer, "Ctrl+C quit")
-}
-
-func TestCommandFooterTextShowsCancelWhilePending(t *testing.T) {
-	m := newModel(context.Background(), Options{})
-	m.pending = true
-
-	footer := m.footerText()
-
-	assertContains(t, footer, "Esc cancel")
-	if strings.Contains(footer, "Esc clear") {
-		t.Fatalf("pending footer should not show clear hint, got %q", footer)
-	}
+	assertContains(t, view, emptyStateTagline)
+	assertNotContains(t, view, "❯ inspect")
 }
 
 func TestHelpCommandAppendsHelpRow(t *testing.T) {
@@ -631,8 +613,15 @@ func TestResumeCommandListsRecentSessions(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("expected /resume to be handled without starting an agent run")
 	}
-	if !transcriptContains(next.transcript, "Sessions") || !transcriptContains(next.transcript, "Newer") || !transcriptContains(next.transcript, "Older") {
+	if !transcriptContains(next.transcript, "Newer") || !transcriptContains(next.transcript, "Older") {
 		t.Fatalf("expected session list in transcript, got %#v", next.transcript)
+	}
+	// The list renders as stacked cards: id + age + title + meta per session.
+	view := next.View()
+	for _, want := range []string{first.SessionID, second.SessionID, "1 events", "anthropic"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("sessions card view missing %q:\n%s", want, view)
+		}
 	}
 }
 
@@ -670,7 +659,7 @@ func TestPromptSubmitAppendsUserAndAssistantRows(t *testing.T) {
 		t.Fatal("expected submit to return agent command")
 	}
 
-	msg := cmd()
+	msg := execCmd(cmd)
 	updated, _ = next.Update(msg)
 	next = updated.(model)
 	if !transcriptContains(next.transcript, "hello back") {
@@ -769,7 +758,7 @@ func TestAgentResponsePreservesToolResultMetadata(t *testing.T) {
 	if row.tool != "apply_patch" || row.status != tools.StatusError || row.detail != diff {
 		t.Fatalf("tool result metadata was not preserved: %#v", row)
 	}
-	assertContains(t, renderRow(row, 80), "@@ -1 +1 @@")
+	assertContains(t, next.renderRow(row, 80, buildRowContext(next.transcript)), "@@ -1 +1 @@")
 }
 
 func TestAgentResponsePreservesPermissionMetadata(t *testing.T) {
@@ -801,8 +790,8 @@ func TestAgentResponsePreservesPermissionMetadata(t *testing.T) {
 	if row.tool != "write_file" || row.permission == nil || row.permission.ToolCallID != "call_1" {
 		t.Fatalf("permission metadata was not preserved: %#v", row)
 	}
-	rendered := renderRow(row, 96)
-	for _, want := range []string{"permission", "write_file", "prompt", "risk:high", "mode=ask", "Creates or overwrites files."} {
+	rendered := next.renderRow(row, 96, buildRowContext(next.transcript))
+	for _, want := range []string{"permission", "write_file", "prompt", "risk:high", "mode=ask", "Creates or overwrites"} {
 		assertContains(t, rendered, want)
 	}
 }
@@ -810,7 +799,6 @@ func TestAgentResponsePreservesPermissionMetadata(t *testing.T) {
 func TestPermissionRequestShowsFocusedPrompt(t *testing.T) {
 	request := testPromptPermissionRequest()
 	m := newModel(context.Background(), Options{})
-	m.showSplash = false
 	m.pending = true
 	m.activeRunID = 7
 	m.width = 96
@@ -933,9 +921,9 @@ func TestPermissionRowRendersSandboxViolations(t *testing.T) {
 		Violation:      &violation,
 	}
 
-	rendered := renderRow(permissionTranscriptRow(event), 96)
+	rendered := newModel(context.Background(), Options{}).renderRow(permissionTranscriptRow(event), 96, buildRowContext(nil))
 
-	for _, want := range []string{"permission", "write_file", "denied", "risk:high", "violation=outside_workspace risk=critical", "../secret.txt"} {
+	for _, want := range []string{"write_file", "denied", "risk:high", "violation=outside_workspace risk=critical", "../secret.txt"} {
 		assertContains(t, rendered, want)
 	}
 }
@@ -1030,7 +1018,7 @@ func TestAgentEventRenderingMappingCoversRuntimeContract(t *testing.T) {
 	}
 	for eventType, tc := range renderedRows {
 		t.Run(string(eventType), func(t *testing.T) {
-			rendered := renderRow(tc.row, 96)
+			rendered := newModel(context.Background(), Options{}).renderRow(tc.row, 96, buildRowContext(nil))
 			for _, want := range tc.wants {
 				assertContains(t, rendered, want)
 			}
@@ -1046,9 +1034,8 @@ func TestAgentEventRenderingMappingCoversRuntimeContract(t *testing.T) {
 	if len(usageRows) != 0 {
 		t.Fatalf("valid usage should update footer without transcript rows, got %#v", usageRows)
 	}
-	assertContains(t, m.usageSegment(), "100↑")
-	assertContains(t, m.usageSegment(), "20↓")
-	assertContains(t, m.statusLine(96), "approve each action")
+	assertContains(t, m.usageStatusSegment(), "120 tok")
+	assertContains(t, m.statusLine(96), "⏵⏵ ask")
 }
 
 func TestToolResultRowDefaultsEmptyStatusToOK(t *testing.T) {
@@ -1092,7 +1079,7 @@ func TestShiftTabCyclesPermissionMode(t *testing.T) {
 
 	// The rendered status label tracks the cycled mode.
 	label, _ := m.modeLabel()
-	if label != "auto-approve edits" {
+	if label != "auto-approve" {
 		t.Fatalf("expected mode label to track cycled mode, got %q", label)
 	}
 }

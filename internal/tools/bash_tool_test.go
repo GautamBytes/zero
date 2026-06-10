@@ -67,6 +67,78 @@ func TestCoreToolsExposeBashTool(t *testing.T) {
 	}
 }
 
+func TestBashToolDescribesHostShellSyntax(t *testing.T) {
+	tool := NewBashTool(t.TempDir())
+	schema := tool.Parameters()
+	description := strings.ToLower(tool.Description() + " " +
+		schema.Properties["command"].Description + " " +
+		schema.Properties["cwd"].Description)
+
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(description, "cmd.exe") || !strings.Contains(description, "cwd") {
+			t.Fatalf("expected Windows cmd.exe and cwd guidance in bash description, got %q", description)
+		}
+		return
+	}
+	if !strings.Contains(description, "/bin/sh") {
+		t.Fatalf("expected /bin/sh guidance in bash description, got %q", description)
+	}
+}
+
+func TestDetectShellCommandIssueFlagsWindowsBashisms(t *testing.T) {
+	issue := detectShellCommandIssue(`cd /d/tmp/zero-pr-158 && ls -la`, "windows")
+	if issue == nil {
+		t.Fatal("expected Windows bash-style cd command to be flagged")
+	}
+	for _, want := range []string{"Windows cmd.exe", "cwd", "list_directory"} {
+		if !strings.Contains(issue.Message+" "+issue.Suggestion, want) {
+			t.Fatalf("expected issue to mention %q, got %#v", want, issue)
+		}
+	}
+}
+
+func TestDetectShellCommandIssueAllowsWindowsCDSwitch(t *testing.T) {
+	issue := detectShellCommandIssue(`cd /d D:\tmp\zero-pr-158 && dir`, "windows")
+	if issue != nil {
+		t.Fatalf("expected valid Windows cd /d switch to pass, got %#v", issue)
+	}
+}
+
+func TestDetectShellCommandIssueRequiresActualLSCommand(t *testing.T) {
+	for _, command := range []string{
+		`echo false ls -la`,
+		`echo list -items`,
+		`powershell -NoProfile -Command "Write-Output ls -la"`,
+	} {
+		if issue := detectShellCommandIssue(command, "windows"); issue != nil {
+			t.Fatalf("expected incidental ls text to pass for %q, got %#v", command, issue)
+		}
+	}
+
+	for _, command := range []string{
+		`ls -la`,
+		`cd C:\tmp && ls -la`,
+		`cd C:\tmp && ls`,
+	} {
+		if issue := detectShellCommandIssue(command, "windows"); issue == nil {
+			t.Fatalf("expected actual ls command to be flagged for %q", command)
+		}
+	}
+}
+
+func TestDetectShellOutputIssueAddsWindowsSyntaxHint(t *testing.T) {
+	issue := detectShellOutputIssue(`cd /d/tmp/zero-pr-158 && ls -la`, "The syntax of the command is incorrect.", "windows")
+	if issue == nil {
+		t.Fatal("expected Windows syntax error to get shell guidance")
+	}
+	rendered := appendShellIssueHint("stderr:\nThe syntax of the command is incorrect.\nexit_code: 1", *issue)
+	for _, want := range []string{"[zero] shell issue:", "Windows cmd.exe", "Suggestion:"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected rendered hint to contain %q, got %q", want, rendered)
+		}
+	}
+}
+
 func TestRegistryBlocksBashWithoutGrant(t *testing.T) {
 	registry := NewRegistry()
 	registry.Register(NewBashTool(t.TempDir()))

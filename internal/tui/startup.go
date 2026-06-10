@@ -11,184 +11,140 @@ const (
 	defaultStartupWidth  = 96
 	defaultStartupHeight = 30
 	minStartupWidth      = 58
-	maxPromptWidth       = 140
 )
 
-// zeroLogoLines is the ZERO wordmark in the ANSI Shadow figlet style. The solid
-// block strokes render in bright cyan and the drop-shadow box-drawing strokes in
-// dim cyan, which gives the wordmark depth without any per-glyph color hacks.
-var zeroLogoLines = []string{
-	`███████╗███████╗██████╗  ██████╗ `,
-	`╚══███╔╝██╔════╝██╔══██╗██╔═══██╗`,
-	`  ███╔╝ █████╗  ██████╔╝██║   ██║`,
-	` ███╔╝  ██╔══╝  ██╔══██╗██║   ██║`,
-	`███████╗███████╗██║  ██║╚██████╔╝`,
-	`╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ `,
+// zeroGlyphLines is the block-art `0` shown on the empty chat surface,
+// derived from the O columns of the old ANSI Shadow wordmark.
+var zeroGlyphLines = []string{
+	` ██████╗ `,
+	`██╔═══██╗`,
+	`██║   ██║`,
+	`██║   ██║`,
+	`╚██████╔╝`,
+	` ╚═════╝ `,
 }
 
-// logoShadowRunes are the box-drawing strokes that form the wordmark's shadow and
-// render in the dim cyan tone; everything else (the solid blocks) renders bright.
-var logoShadowRunes = map[rune]bool{
-	'╗': true, '╔': true, '╝': true, '╚': true, '║': true, '═': true,
-}
+const emptyStateTagline = "a std-lib-first coding agent · bring your own key · no lock-in"
 
-func (m model) startupView() string {
-	width := normalizedStartupWidth(m.width)
+// emptyState renders the centered stream-area block shown while the
+// transcript has no real content: the brand glyph, tagline, active-model
+// hint, and the three starter-suggestion chips (inserted by keys 1–3).
+func (m model) emptyState(width int) string {
+	lines := []string{}
+	for _, glyph := range zeroGlyphLines {
+		lines = append(lines, centerLine(zeroTheme.accent.Render(glyph), width))
+	}
+	lines = append(lines, "")
+	lines = append(lines, centerLine(zeroTheme.muted.Render(emptyStateTagline), width))
+	lines = append(lines, centerLine(m.emptyStateModelHint(), width))
+	lines = append(lines, "")
+	lines = append(lines, m.emptyStateChips(width)...)
+	// centerLine pads but never truncates; below ~62 cols the tagline (and on
+	// long model ids, the hint) would exceed the frame without this fit.
+	for index := range lines {
+		lines[index] = fitStyledLine(lines[index], width)
+	}
+
+	// Vertically center within the stream area: the frame around it (title bar,
+	// rules, composer, status line) occupies ~6 terminal rows.
 	height := normalizedStartupHeight(m.height)
-
-	header := m.startupHeader(width)
-	logo := m.startupLogo(width)
-	chips := centerLine(m.commandChips(), width)
-	subtitle := centerLine(zeroTheme.accent.Render("terminal coding agent"), width)
-	prompt := m.startupPrompt(width)
-	shortcuts := centerLine(m.modeHint(), width)
-
-	contentLines := countLines(header) + countLines(logo) + 1 + 1 + countLines(prompt) + 1
-	centerGap := clamp((height-contentLines)/3, 1, 7)
-	promptGap := clamp(height-contentLines-centerGap, 1, 8)
-
-	var builder strings.Builder
-	builder.WriteString(header)
-	builder.WriteString(strings.Repeat("\n", centerGap))
-	builder.WriteString(logo)
-	builder.WriteString("\n")
-	builder.WriteString(subtitle)
-	builder.WriteString("\n\n")
-	builder.WriteString(chips)
-	builder.WriteString(strings.Repeat("\n", promptGap))
-	builder.WriteString(prompt)
-	builder.WriteString("\n")
-	builder.WriteString(shortcuts)
-
-	return builder.String()
+	gap := clamp((height-6-len(lines))/2, 0, 12)
+	return strings.Repeat("\n", gap) + strings.Join(lines, "\n") + strings.Repeat("\n", gap)
 }
 
-func (m model) startupHeader(width int) string {
-	project := startupProjectName(m.cwd)
-	provider := displayValue(m.providerName, "none")
-	model := displayValue(m.modelName, "none")
-	line := startupHeaderLine(width-4, []headerCandidate{
-		{
-			left: zeroTheme.accent.Render("ZERO") +
-				zeroTheme.muted.Render(" | cwd: ") + zeroTheme.text.Render(displayValue(m.cwd, "unknown")) +
-				zeroTheme.muted.Render(" | project: ") + zeroTheme.text.Render(project),
-			right: zeroTheme.muted.Render("status: ") + zeroTheme.green.Render("READY") +
-				zeroTheme.muted.Render(" | provider: ") + zeroTheme.accent.Render(provider) +
-				zeroTheme.text.Render(" / "+model),
-		},
-		{
-			left: zeroTheme.accent.Render("ZERO") +
-				zeroTheme.muted.Render(" | cwd: ") + zeroTheme.text.Render(displayValue(pathBaseName(m.cwd), "unknown")) +
-				zeroTheme.muted.Render(" | project: ") + zeroTheme.text.Render(project),
-			right: zeroTheme.green.Render("READY") +
-				zeroTheme.muted.Render(" | provider: ") + zeroTheme.accent.Render(provider) +
-				zeroTheme.text.Render(" / "+model),
-		},
-		{
-			left:  zeroTheme.accent.Render("ZERO") + zeroTheme.muted.Render(" | ") + zeroTheme.text.Render(project),
-			right: zeroTheme.green.Render("READY") + zeroTheme.muted.Render(" | ") + zeroTheme.accent.Render(provider) + zeroTheme.text.Render("/"+model),
-		},
-		{
-			left:  zeroTheme.accent.Render("ZERO"),
-			right: zeroTheme.green.Render("READY"),
-		},
-	})
-	return borderedBlock(width, []string{line})
+func (m model) emptyStateModelHint() string {
+	provider := strings.TrimSpace(m.providerName)
+	model := strings.TrimSpace(m.modelName)
+	target := provider
+	if target != "" && model != "" {
+		target += "/"
+	}
+	target += model
+	if target == "" {
+		return zeroTheme.faint.Render("no provider configured · set one with /provider")
+	}
+	return zeroTheme.faint.Render("running zero against ") + zeroTheme.ink.Render(target)
 }
 
-func startupProjectName(cwd string) string {
-	project := strings.ToLower(pathBaseName(cwd))
-	if project == "." || project == "" {
-		return "zero"
-	}
-	return project
-}
-
-// pathBaseName accepts both Windows and POSIX separators so CI can render a
-// Windows workspace path deterministically on Linux and macOS runners.
-func pathBaseName(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-
-	value = strings.TrimRight(value, `/\`)
-	if value == "" {
-		return ""
-	}
-
-	separator := maxInt(strings.LastIndex(value, "/"), strings.LastIndex(value, `\`))
-	if separator >= 0 && separator+1 < len(value) {
-		return value[separator+1:]
-	}
-	return value
-}
-
-func (m model) startupLogo(width int) string {
-	lines := make([]string, 0, len(zeroLogoLines))
-	for _, line := range zeroLogoLines {
-		lines = append(lines, centerLine(renderTwoToneLogo(line), width))
-	}
-	return strings.Join(lines, "\n")
-}
-
-// renderTwoToneLogo colors a single wordmark line: solid blocks bright, shadow
-// strokes dim. lipgloss.Width (used by centerLine) ignores ANSI, so centering
-// stays correct regardless of color profile.
-func renderTwoToneLogo(line string) string {
-	var builder strings.Builder
-	for _, glyph := range line {
-		switch {
-		case glyph == ' ':
-			builder.WriteByte(' ')
-		case logoShadowRunes[glyph]:
-			builder.WriteString(zeroTheme.logoDim.Render(string(glyph)))
-		default:
-			builder.WriteString(zeroTheme.logoBright.Render(string(glyph)))
+func (m model) emptyStateChips(width int) []string {
+	rows := make([]string, 0, len(emptyStateSuggestions))
+	boxWidth := 0
+	for _, suggestion := range emptyStateSuggestions {
+		row := zeroTheme.userPrompt.Render("❯ ") + zeroTheme.ink.Render(suggestion)
+		rows = append(rows, row)
+		if w := lipgloss.Width(row) + 4; w > boxWidth {
+			boxWidth = w
 		}
 	}
-	return builder.String()
-}
-
-func (m model) commandChips() string {
-	chips := startupCommandNames()
-	parts := make([]string, 0, len(chips))
-	for _, chip := range chips {
-		parts = append(parts, zeroTheme.border.Render("[ "+chip+" ]"))
+	if boxWidth > width {
+		boxWidth = width
 	}
-	return strings.Join(parts, "  ")
-}
-
-func (m model) startupPrompt(width int) string {
-	promptWidth := width - 12
-	if promptWidth > maxPromptWidth {
-		promptWidth = maxPromptWidth
-	}
-	if promptWidth < minStartupWidth {
-		promptWidth = minStartupWidth
-	}
-
-	block := borderedBlock(promptWidth, []string{m.input.View()})
-	return indentBlock(block, (width-promptWidth)/2)
+	block := borderedBlock(boxWidth, rows)
+	return strings.Split(indentBlock(block, maxInt(0, (width-boxWidth)/2)), "\n")
 }
 
 func borderedBlock(width int, lines []string) string {
+	return styledBlock(width, lines, zeroTheme.line)
+}
+
+// styledBlock draws a rounded box around lines with the given border style,
+// padding every row to the full width.
+func styledBlock(width int, lines []string, borderStyle lipgloss.Style) string {
+	return styledBlockFill(width, lines, borderStyle, lipgloss.NewStyle())
+}
+
+// styledBlockFill is styledBlock with a fill style painting the row padding,
+// so tinted cards (permission, panel surfaces) read as solid bands. On tiny
+// terminals every card loses its side borders (top/bottom rules stay) so the
+// 4 border cells go back to content.
+func styledBlockFill(width int, lines []string, borderStyle lipgloss.Style, fill lipgloss.Style) string {
 	if width < 4 {
 		width = 4
 	}
 
+	if widthTier(width) == tierTiny {
+		rule := borderStyle.Render(strings.Repeat("─", width))
+		body := make([]string, 0, len(lines)+2)
+		body = append(body, rule)
+		for _, line := range lines {
+			body = append(body, fitStyledLine(line, width))
+		}
+		body = append(body, rule)
+		return strings.Join(body, "\n")
+	}
+
 	rule := strings.Repeat("─", width-2)
-	top := zeroTheme.border.Render("╭" + rule + "╮")
-	bottom := zeroTheme.border.Render("╰" + rule + "╯")
+	top := borderStyle.Render("╭" + rule + "╮")
+	bottom := borderStyle.Render("╰" + rule + "╯")
 	body := make([]string, 0, len(lines)+2)
 	body = append(body, top)
 	for _, line := range lines {
 		available := width - 4
 		fitted := fitStyledLine(line, available)
-		body = append(body, zeroTheme.border.Render("│ ")+fitted+strings.Repeat(" ", maxInt(0, available-lipgloss.Width(fitted)))+zeroTheme.border.Render(" │"))
+		pad := fill.Render(strings.Repeat(" ", maxInt(0, available-lipgloss.Width(fitted))))
+		body = append(body, borderStyle.Render("│ ")+fitted+pad+borderStyle.Render(" │"))
 	}
 	body = append(body, bottom)
 	return strings.Join(body, "\n")
+}
+
+// middleTruncate shortens a path-like value from the middle so both the
+// leading segment and the file name survive: internal/…/root.go.
+func middleTruncate(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return truncateRunes(value, limit)
+	}
+	keep := limit - 1
+	front := keep / 2
+	back := keep - front
+	return string(runes[:front]) + "…" + string(runes[len(runes)-back:])
 }
 
 func joinHeaderLine(left string, right string, width int) string {
@@ -211,7 +167,13 @@ func startupHeaderLine(width int, candidates []headerCandidate) string {
 			return line
 		}
 	}
-	return zeroTheme.accent.Render("ZERO") + strings.Repeat(" ", maxInt(1, width-10)) + zeroTheme.green.Render("READY")
+	// Nothing fits whole: truncate the most minimal candidate rather than
+	// inventing different content.
+	if len(candidates) == 0 {
+		return ""
+	}
+	last := candidates[len(candidates)-1]
+	return fitStyledLine(joinHeaderLine(last.left, last.right, width), width)
 }
 
 func centerLine(line string, width int) string {
@@ -257,14 +219,21 @@ func truncateStyledLine(line string, width int) string {
 	targetWidth := width - ellipsisWidth
 	usedWidth := 0
 	sawANSI := false
+	openLink := false
 
 	var builder strings.Builder
 	for index := 0; index < len(line); {
 		if line[index] == '\x1b' {
 			end := ansiSequenceEnd(line, index)
 			if end > index {
-				builder.WriteString(line[index:end])
+				sequence := line[index:end]
+				builder.WriteString(sequence)
 				sawANSI = true
+				// Track OSC 8 hyperlink state: truncating between an open and
+				// its terminator would leak the link onto everything after.
+				if strings.HasPrefix(sequence, "\x1b]8;") {
+					openLink = sequence != "\x1b]8;;\x1b\\" && sequence != "\x1b]8;;\a"
+				}
 				index = end
 				continue
 			}
@@ -284,6 +253,9 @@ func truncateStyledLine(line string, width int) string {
 		index += size
 	}
 
+	if openLink {
+		builder.WriteString("\x1b]8;;\x1b\\")
+	}
 	builder.WriteString(ellipsis)
 	if sawANSI {
 		builder.WriteString(resetANSI)
@@ -300,24 +272,44 @@ func ansiSequenceEnd(value string, start int) int {
 		return index
 	}
 
-	if value[index] != '[' {
+	switch value[index] {
+	case '[':
+		// CSI: terminated by a final byte in 0x40–0x7e.
+		for index++; index < len(value); index++ {
+			if value[index] >= 0x40 && value[index] <= 0x7e {
+				return index + 1
+			}
+		}
+		return len(value)
+	case ']':
+		// OSC (e.g. the OSC 8 hyperlinks on tool-card paths): terminated by
+		// BEL or ST (ESC \). Without this branch the truncator treated the
+		// payload as printable text, wrecking the width math.
+		for index++; index < len(value); index++ {
+			if value[index] == '\a' {
+				return index + 1
+			}
+			if value[index] == '\x1b' && index+1 < len(value) && value[index+1] == '\\' {
+				return index + 2
+			}
+		}
+		return len(value)
+	default:
 		return minInt(start+2, len(value))
 	}
-
-	for index++; index < len(value); index++ {
-		if value[index] >= 0x40 && value[index] <= 0x7e {
-			return index + 1
-		}
-	}
-	return len(value)
 }
 
-func normalizedStartupWidth(width int) int {
+// chatWidth resolves the render width for the chat surface. Unlike the old
+// splash floor it respects genuinely tiny terminals (so the <58 tier can
+// engage). The 24-cell floor is deliberate: below it the cards' own minimum
+// width makes the layout meaningless, so we accept terminal-side wrapping
+// there rather than degrade every wider tier.
+func chatWidth(width int) int {
 	if width <= 0 {
 		return defaultStartupWidth
 	}
-	if width < minStartupWidth {
-		return minStartupWidth
+	if width < 24 {
+		return 24
 	}
 	return width
 }
@@ -330,13 +322,6 @@ func normalizedStartupHeight(height int) int {
 		return 18
 	}
 	return height
-}
-
-func countLines(value string) int {
-	if value == "" {
-		return 0
-	}
-	return strings.Count(value, "\n") + 1
 }
 
 func clamp(value int, minimum int, maximum int) int {

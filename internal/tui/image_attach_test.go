@@ -16,10 +16,10 @@ func TestModelSupportsVisionTUI(t *testing.T) {
 		modelName string
 		want      bool
 	}{
-		{modelName: "gpt-4.1", want: true},                  // vision model in the catalog
-		{modelName: "claude-sonnet-4.5", want: true},        // vision model in the catalog
-		{modelName: "claude-haiku-3.5", want: true},         // has vision capability
-		{modelName: "totally-unknown-custom", want: false},  // not in catalog -> can't confirm
+		{modelName: "gpt-4.1", want: true},                 // vision model in the catalog
+		{modelName: "claude-sonnet-4.5", want: true},       // vision model in the catalog
+		{modelName: "claude-haiku-3.5", want: false},       // claude-3-5-haiku has no image input support
+		{modelName: "totally-unknown-custom", want: false}, // not in catalog -> can't confirm
 		{modelName: "", want: false},
 	}
 	for _, tc := range cases {
@@ -138,26 +138,11 @@ func TestTranscriptViewShowsImageChips(t *testing.T) {
 	m := newModel(context.Background(), Options{ModelName: "gpt-4.1"})
 	m.width = 100
 	m.height = 30
-	m.showSplash = false
 	m.pendingImageLabels = []string{"photo.png", "diagram.gif"}
 
 	view := m.transcriptView()
 	if !strings.Contains(view, "photo.png") || !strings.Contains(view, "diagram.gif") {
 		t.Fatalf("transcript view should show pending image chips, got:\n%s", view)
-	}
-}
-
-func TestZerolineViewShowsImageChips(t *testing.T) {
-	m := newModel(context.Background(), Options{ModelName: "gpt-4.1", Skin: "zeroline"})
-	m.width = 100
-	m.height = 30
-	m.showSplash = false
-	m.booted = true
-	m.pendingImageLabels = []string{"photo.png"}
-
-	view := m.zerolineView()
-	if !strings.Contains(view, "photo.png") {
-		t.Fatalf("zeroline view should show pending image chip, got:\n%s", view)
 	}
 }
 
@@ -200,7 +185,7 @@ func TestSubmitThreadsImagesThenClears(t *testing.T) {
 		t.Fatalf("submit must clear pending images, got %d/%d", len(next.pendingImages), len(next.pendingImageLabels))
 	}
 
-	cmd() // run the agent goroutine; it invokes captureRunImages
+	execCmd(cmd) // run the agent goroutine; it invokes captureRunImages
 
 	select {
 	case imgs := <-captured:
@@ -262,7 +247,7 @@ func TestSubmitDropsImagesWhenModelSwitchedToNonVision(t *testing.T) {
 		t.Fatalf("expected an inline drop notice, got %q", notice)
 	}
 
-	cmd() // run the agent goroutine; it invokes captureRunImages
+	execCmd(cmd) // run the agent goroutine; it invokes captureRunImages
 
 	select {
 	case imgs := <-captured:

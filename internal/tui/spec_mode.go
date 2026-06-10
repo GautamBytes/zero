@@ -19,7 +19,10 @@ func (m model) handleSpecCommand(task string) (tea.Model, tea.Cmd) {
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: "Usage: /spec <task>"})
 		return m, nil
 	}
-	if m.pending {
+	// m.exiting guards the post-Ctrl+C flush window: starting a run there would
+	// let the deferred tea.Quit kill it mid-flight and orphan its checkpoints —
+	// the same gate handleSubmit applies to plain prompts.
+	if m.pending || m.exiting {
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendError, text: "Cannot start spec mode while a run is active."})
 		return m, nil
 	}
@@ -69,12 +72,12 @@ func (m model) handleSpecCommand(task string) (tea.Model, tea.Cmd) {
 	m.activeRunID = m.runID
 	m.runCancel = cancel
 	m.pending = true
-	return m, m.runAgentWithOptions(m.activeRunID, runCtx, task, turnImages, tuiAgentRunOptions{
+	return m, tea.Batch(m.runAgentWithOptions(m.activeRunID, runCtx, task, turnImages, tuiAgentRunOptions{
 		registry:       specRegistry,
 		permissionMode: agent.PermissionModeSpecDraft,
 		systemPrompt:   specmode.DraftSystemPrompt,
 		specDraft:      true,
-	})
+	}), m.spinner.Tick)
 }
 
 func (m model) createSpecDraftSession(task string) (model, error) {
@@ -204,7 +207,7 @@ func (m model) approveSpecReview() (tea.Model, tea.Cmd) {
 	m.activeRunID = m.runID
 	m.runCancel = cancel
 	m.pending = true
-	return m, m.runAgent(m.activeRunID, runCtx, prompt, nil)
+	return m, tea.Batch(m.runAgent(m.activeRunID, runCtx, prompt, nil), m.spinner.Tick)
 }
 
 func (m model) rejectSpecReview(reason string) (tea.Model, tea.Cmd) {
@@ -250,13 +253,22 @@ func cloneToolRegistry(registry *tools.Registry) *tools.Registry {
 	return clone
 }
 
+// renderFocusedSpecReviewPrompt draws the spec-review gate in the shared card
+// language (badge + body + key chips) with line borders. Key handling lives
+// in handleSpecReviewKey, unchanged.
 func renderFocusedSpecReviewPrompt(review pendingSpecReviewPrompt, width int) string {
+	fill := zeroTheme.onPanel
+	actions := zeroTheme.badge.Render(" [a] approve ") +
+		fill(zeroTheme.ink).Render(" ") +
+		fill(zeroTheme.red).Render("[r]") + fill(zeroTheme.ink).Render(" reject ") +
+		fill(zeroTheme.accent).Render("[e]") + fill(zeroTheme.ink).Render(" edit file ") +
+		fill(zeroTheme.faint).Render("[esc] cancel")
 	lines := []string{
-		zeroTheme.zero.Render("◇ spec review"),
-		"path: " + reviewDisplayPath(review),
-		"[a] approve  [r] reject  [e] edit file  [esc] cancel",
+		zeroTheme.badge.Render(" SPEC REVIEW "),
+		fill(zeroTheme.faint).Render("path: ") + fill(zeroTheme.ink).Render(reviewDisplayPath(review)),
+		actions,
 	}
-	return borderedBlock(width, lines)
+	return styledBlockFill(width, lines, zeroTheme.line, zeroTheme.panel)
 }
 
 func specReviewSummary(review pendingSpecReviewPrompt) string {
@@ -289,8 +301,6 @@ func specImplementationTitle(review pendingSpecReviewPrompt) string {
 	if title == "" {
 		return "Spec implementation"
 	}
-	if len(title) > tuiSessionTitleLimit {
-		title = title[:tuiSessionTitleLimit]
-	}
+	title = cutRunes(title, tuiSessionTitleLimit)
 	return title + " implementation"
 }

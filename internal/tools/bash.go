@@ -24,15 +24,16 @@ type bashTool struct {
 }
 
 func NewBashTool(workspaceRoot string) Tool {
+	shellGuidance := shellGuidanceForGOOS(runtime.GOOS)
 	return bashTool{
 		baseTool: baseTool{
 			name:        "bash",
-			description: "Execute a shell command inside the workspace after permission is granted.",
+			description: "Execute a shell command inside the workspace after permission is granted. " + shellGuidance,
 			parameters: Schema{
 				Type: "object",
 				Properties: map[string]PropertySchema{
-					"command":    {Type: "string", Description: "Shell command to execute."},
-					"cwd":        {Type: "string", Description: "Workspace directory to run the command in. Defaults to workspace root.", Default: "."},
+					"command":    {Type: "string", Description: "Shell command to execute using the host shell. " + shellGuidance},
+					"cwd":        {Type: "string", Description: "Workspace directory to run the command in. Defaults to workspace root. Prefer cwd over cd when changing directories.", Default: "."},
 					"timeout_ms": {Type: "integer", Description: "Command timeout in milliseconds.", Default: defaultBashTimeoutMS, Minimum: intPtr(1), Maximum: intPtr(maxBashTimeoutMS)},
 				},
 				Required:             []string{"command"},
@@ -64,6 +65,9 @@ func (tool bashTool) run(ctx context.Context, args map[string]any, engine *zeroS
 	timeoutMS, err := intArg(args, "timeout_ms", defaultBashTimeoutMS, 1, maxBashTimeoutMS)
 	if err != nil {
 		return errorResult("Error: Invalid arguments for bash: " + err.Error())
+	}
+	if issue := detectShellCommandIssue(commandText, runtime.GOOS); issue != nil {
+		return shellIssueBlockResult(*issue)
 	}
 
 	// Pre-execution safety: refuse interactive commands (editors, pagers, REPLs,
@@ -122,7 +126,7 @@ func (tool bashTool) run(ctx context.Context, args map[string]any, engine *zeroS
 		}
 		return Result{
 			Status: StatusError,
-			Output: formatBashOutput(stdout.String(), stderr.String(), exitCode),
+			Output: formatBashOutputWithShellHint(commandText, stdout.String(), stderr.String(), exitCode, meta),
 			Meta:   meta,
 		}
 	}
@@ -131,6 +135,21 @@ func (tool bashTool) run(ctx context.Context, args map[string]any, engine *zeroS
 		Status: StatusOK,
 		Output: formatBashOutput(stdout.String(), stderr.String(), exitCode),
 		Meta:   meta,
+	}
+}
+
+func shellIssueBlockResult(issue shellIssue) Result {
+	return Result{
+		Status: StatusError,
+		Output: appendShellIssueHint("", issue),
+		Meta: map[string]string{
+			"exit_code":   "-1",
+			"shell_issue": issue.Kind,
+		},
+		Display: Display{
+			Summary: issue.Message,
+			Kind:    "shell",
+		},
 	}
 }
 
@@ -246,4 +265,13 @@ func formatBashOutput(stdout string, stderr string, exitCode int) string {
 		return "Command completed with no output."
 	}
 	return strings.Join(parts, "\n")
+}
+
+func formatBashOutputWithShellHint(command string, stdout string, stderr string, exitCode int, meta map[string]string) string {
+	output := formatBashOutput(stdout, stderr, exitCode)
+	if issue := detectShellOutputIssue(command, stdout+"\n"+stderr, runtime.GOOS); issue != nil {
+		meta["shell_issue"] = issue.Kind
+		output = appendShellIssueHint(output, *issue)
+	}
+	return output
 }

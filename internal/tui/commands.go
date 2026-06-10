@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"sort"
 	"strings"
 )
 
@@ -48,13 +47,12 @@ const (
 )
 
 type commandDefinition struct {
-	name         string
-	aliases      []string
-	usage        string
-	group        commandGroup
-	description  string
-	kind         commandKind
-	startupOrder int
+	name        string
+	aliases     []string
+	usage       string
+	group       commandGroup
+	description string
+	kind        commandKind
 }
 
 type parsedCommand struct {
@@ -65,20 +63,18 @@ type parsedCommand struct {
 
 var commandDefinitions = []commandDefinition{
 	{
-		name:         "/provider",
-		usage:        "/provider",
-		group:        commandGroupModel,
-		description:  "Show the active provider.",
-		kind:         commandProvider,
-		startupOrder: 5,
+		name:        "/provider",
+		usage:       "/provider",
+		group:       commandGroupModel,
+		description: "Show the active provider.",
+		kind:        commandProvider,
 	},
 	{
-		name:         "/model",
-		usage:        "/model [list|id]",
-		group:        commandGroupModel,
-		description:  "Show or switch the active model.",
-		kind:         commandModel,
-		startupOrder: 4,
+		name:        "/model",
+		usage:       "/model [list|id]",
+		group:       commandGroupModel,
+		description: "Show or switch the active model.",
+		kind:        commandModel,
 	},
 	{
 		name:        "/mode",
@@ -88,12 +84,11 @@ var commandDefinitions = []commandDefinition{
 		kind:        commandMode,
 	},
 	{
-		name:         "/plan",
-		usage:        "/plan",
-		group:        commandGroupSession,
-		description:  "Show planning mode status.",
-		kind:         commandPlan,
-		startupOrder: 1,
+		name:        "/plan",
+		usage:       "/plan",
+		group:       commandGroupSession,
+		description: "Show planning mode status.",
+		kind:        commandPlan,
 	},
 	{
 		name:        "/permissions",
@@ -103,12 +98,11 @@ var commandDefinitions = []commandDefinition{
 		kind:        commandPermissions,
 	},
 	{
-		name:         "/tools",
-		usage:        "/tools",
-		group:        commandGroupTools,
-		description:  "List registered tools.",
-		kind:         commandTools,
-		startupOrder: 3,
+		name:        "/tools",
+		usage:       "/tools",
+		group:       commandGroupTools,
+		description: "List registered tools.",
+		kind:        commandTools,
 	},
 	{
 		name:        "/context",
@@ -197,13 +191,12 @@ var commandDefinitions = []commandDefinition{
 		kind:        commandConfig,
 	},
 	{
-		name:         "/debug",
-		aliases:      []string{"/debug-mode"},
-		usage:        "/debug",
-		group:        commandGroupRuntime,
-		description:  "Show debug mode status.",
-		kind:         commandDebug,
-		startupOrder: 2,
+		name:        "/debug",
+		aliases:     []string{"/debug-mode"},
+		usage:       "/debug",
+		group:       commandGroupRuntime,
+		description: "Show debug mode status.",
+		kind:        commandDebug,
 	},
 	{
 		name:        "/theme",
@@ -342,27 +335,6 @@ func formatCommandHelpLine(command commandDefinition) string {
 		label += " (" + strings.Join(command.aliases, ", ") + ")"
 	}
 	return label + " - " + command.description
-}
-
-func startupCommandNames() []string {
-	chips := make([]commandDefinition, 0, len(commandDefinitions))
-	for _, command := range commandDefinitions {
-		if command.startupOrder > 0 {
-			chips = append(chips, command)
-		}
-	}
-	sort.SliceStable(chips, func(left int, right int) bool {
-		if chips[left].startupOrder == chips[right].startupOrder {
-			return chips[left].name < chips[right].name
-		}
-		return chips[left].startupOrder < chips[right].startupOrder
-	})
-
-	names := make([]string, 0, len(chips))
-	for _, command := range chips {
-		names = append(names, command.name)
-	}
-	return names
 }
 
 func commandGroupOrder() []commandGroup {

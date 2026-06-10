@@ -13,63 +13,128 @@ import (
 	"github.com/Gitlawb/zero/internal/agent"
 )
 
-// headerBar renders the top zone of the working view: a single status line plus a
-// thin rule. Layout: zero · cwd · branch · provider/model  ............  ● state
-func (m model) headerBar(width int) string {
-	left := strings.Join(nonEmpty([]string{
-		zeroTheme.accent.Render("zero"),
-		zeroTheme.text.Render(shortenPath(m.cwd)),
-		branchSegment(m.gitBranch),
-		m.providerSegment(),
-	}), zeroTheme.muted.Render(" · "))
+// layoutTier buckets the terminal width into the spec's adaptive tiers. It
+// is derived from the live width at every render, so a WindowSizeMsg
+// re-evaluates it implicitly.
+type layoutTier int
 
-	right := m.stateSegment()
-	line := joinHeaderLine(left, right, width)
-	rule := zeroTheme.border.Render(strings.Repeat("─", width))
+const (
+	tierTiny   layoutTier = iota // < 58: single-segment header, rail-less cards
+	tierNarrow                   // 58–79: no gutters, bare badge, lean status
+	tierMedium                   // 80–99: no tool-arg column, no ctx, no "interactive"
+	tierFull                     // ≥ 100: everything
+)
+
+func widthTier(width int) layoutTier {
+	switch {
+	case width >= 100:
+		return tierFull
+	case width >= 80:
+		return tierMedium
+	case width >= minStartupWidth:
+		return tierNarrow
+	default:
+		return tierTiny
+	}
+}
+
+// titleBar renders the top zone of the chat surface: the brand badge, cwd and
+// branch on the left, provider/model and context window on the right, then a
+// rule. Segments drop with the width tier (full → no ctx → no cwd → bare
+// badge + model only), reusing the startupHeaderLine candidate fallback.
+func (m model) titleBar(width int) string {
+	tier := widthTier(width)
+
+	badge := zeroTheme.badge.Render(" 0 ") + " " + zeroTheme.ink.Bold(true).Render("zero")
+	if tier <= tierNarrow {
+		badge = zeroTheme.accent.Render("0") + " " + zeroTheme.ink.Bold(true).Render("zero")
+	}
+	cwd := zeroTheme.faintest.Render(" / ") + zeroTheme.muted.Render(shortenPath(m.cwd))
+	branch := ""
+	if b := strings.TrimSpace(m.gitBranch); b != "" {
+		branch = " " + zeroTheme.faint.Render(b)
+	}
+	model := m.titleModelSegment()
+	ctx := ""
+	if window := modelContextWindow(m.modelName); window > 0 {
+		ctx = zeroTheme.faint.Render(" · " + formatContextWindow(window))
+	}
+
+	var candidates []headerCandidate
+	switch tier {
+	case tierFull:
+		candidates = []headerCandidate{
+			{left: badge + cwd + branch, right: model + ctx},
+			{left: badge + cwd + branch, right: model},
+			{left: badge, right: model},
+		}
+	case tierMedium:
+		candidates = []headerCandidate{
+			{left: badge + cwd + branch, right: model},
+			{left: badge, right: model},
+		}
+	case tierNarrow:
+		candidates = []headerCandidate{
+			{left: badge, right: model},
+		}
+	default:
+		// Tiny: one segment, no right column.
+		candidates = []headerCandidate{
+			{left: badge, right: ""},
+		}
+	}
+
+	line := startupHeaderLine(width, candidates)
+	rule := zeroTheme.line.Render(strings.Repeat("─", width))
 	return line + "\n" + rule
 }
 
-func (m model) providerSegment() string {
+func (m model) titleModelSegment() string {
 	provider := strings.TrimSpace(m.providerName)
 	model := strings.TrimSpace(m.modelName)
-	if provider == "" && model == "" {
+	switch {
+	case provider == "" && model == "":
 		return zeroTheme.muted.Render("no provider")
+	case model == "":
+		return zeroTheme.ink.Render(provider)
+	case provider == "":
+		return zeroTheme.ink.Render(model)
+	default:
+		return zeroTheme.ink.Render(provider + "/" + model)
 	}
-	if model == "" {
-		return zeroTheme.accent.Render(provider)
-	}
-	if provider == "" {
-		return zeroTheme.text.Render(model)
-	}
-	return zeroTheme.accent.Render(provider) + zeroTheme.muted.Render("/") + zeroTheme.text.Render(model)
 }
 
-func (m model) stateSegment() string {
-	if m.pending {
-		return zeroTheme.amber.Render("● working")
-	}
-	return zeroTheme.green.Render("● ready")
-}
-
-func branchSegment(branch string) string {
-	branch = strings.TrimSpace(branch)
-	if branch == "" {
-		return ""
-	}
-	return zeroTheme.muted.Render(branch)
-}
-
-// statusLine renders the bottom zone: the permission-mode indicator on the left and
-// the live model/usage readout on the right.
+// statusLine renders the bottom readout as ` │ `-separated groups: provider
+// and model on the left, then a flexible gap, then tokens/cost, the surface
+// name, and the permission mode. Groups drop with the width tier: medium
+// loses "interactive", narrow keeps provider+tokens+mode only, tiny shows
+// just the mode.
 func (m model) statusLine(width int) string {
-	left := m.modeSegment()
-	right := m.usageSegment()
-	return joinHeaderLine(left, right, width)
-}
-
-func (m model) modeSegment() string {
+	tier := widthTier(width)
+	separator := zeroTheme.line.Render(" │ ")
 	label, style := m.modeLabel()
-	return style.Render("⏵⏵ "+label) + zeroTheme.muted.Render(" · shift+tab to cycle")
+	mode := style.Render("⏵⏵ " + label)
+
+	if tier == tierTiny {
+		return fitStyledLine(mode, width)
+	}
+
+	left := zeroTheme.accent.Render("●") + " " + zeroTheme.ink.Render(displayValue(strings.TrimSpace(m.providerName), "no provider"))
+	if model := strings.TrimSpace(m.modelName); model != "" && tier >= tierMedium {
+		left += separator + zeroTheme.muted.Render(model)
+	}
+
+	rightGroups := []string{}
+	if usage := m.usageStatusSegment(); usage != "" {
+		rightGroups = append(rightGroups, zeroTheme.muted.Render(usage))
+	}
+	if tier == tierFull {
+		rightGroups = append(rightGroups, zeroTheme.faint.Render("interactive"))
+	}
+	rightGroups = append(rightGroups, mode)
+	right := strings.Join(rightGroups, separator)
+
+	return fitStyledLine(joinHeaderLine(left, right, width), width)
 }
 
 // nextPermissionMode toggles between the two prompt-respecting modes:
@@ -94,29 +159,22 @@ func nextPermissionMode(mode agent.PermissionMode) agent.PermissionMode {
 func (m model) modeLabel() (string, lipgloss.Style) {
 	switch m.permissionMode {
 	case agent.PermissionModeAuto:
-		return "auto-approve edits", zeroTheme.modeAuto
+		return "auto-approve", zeroTheme.modeAuto
 	case agent.PermissionModeAsk:
-		return "approve each action", zeroTheme.modeAsk
+		return "ask", zeroTheme.modeAsk
 	case agent.PermissionModeUnsafe:
-		return "bypass permissions", zeroTheme.modeUnsafe
+		return "unsafe", zeroTheme.modeUnsafe
 	default:
 		mode := strings.TrimSpace(string(m.permissionMode))
 		if mode == "" {
-			return "auto-approve edits", zeroTheme.modeAuto
+			return "auto-approve", zeroTheme.modeAuto
 		}
 		return mode, zeroTheme.muted
 	}
 }
 
-func (m model) usageSegment() string {
-	model := displayValue(m.modelName, "no model")
-	usage := m.usageStatusSegment()
-	if usage == "" {
-		return zeroTheme.text.Render(model)
-	}
-	return zeroTheme.text.Render(model) + zeroTheme.muted.Render(" · "+usage)
-}
-
+// usageStatusSegment summarizes this session's consumption for the status
+// line: cumulative tokens, plus cost once anything is priced.
 func (m model) usageStatusSegment() string {
 	if m.usageTracker == nil {
 		return ""
@@ -124,26 +182,18 @@ func (m model) usageStatusSegment() string {
 	summary := m.usageTracker.Summary()
 	if summary.RecordCount == 0 {
 		if m.unpricedRequests > 0 {
-			return fmt.Sprintf("%s tok", humanCount(m.unpricedTokens))
+			return humanCount(m.unpricedTokens) + " tok"
 		}
 		return ""
 	}
-	return fmt.Sprintf("%s↑ %s↓ · %s",
-		humanCount(summary.InputTokens),
-		humanCount(summary.OutputTokens),
+	return fmt.Sprintf("%s tok · %s",
+		humanCount(summary.InputTokens+summary.OutputTokens),
 		summary.FormattedTotalCost,
 	)
 }
 
-// modeHint is the splash-screen variant of the mode indicator, mirroring the
-// professional CLI status line instead of raw keycap hints.
-func (m model) modeHint() string {
-	label, style := m.modeLabel()
-	return style.Render("⏵⏵ "+label) +
-		zeroTheme.muted.Render(" · shift+tab to cycle · ") +
-		zeroTheme.muted.Render("← agents")
-}
-
+// humanCount renders a token count the way the status line wants it: 999,
+// 12.4K, 200K.
 func humanCount(n int) string {
 	if n < 0 {
 		n = 0
@@ -152,8 +202,20 @@ func humanCount(n int) string {
 		return strconv.Itoa(n)
 	}
 	value := float64(n) / 1000
-	text := fmt.Sprintf("%.1fk", value)
-	return strings.Replace(text, ".0k", "k", 1)
+	text := fmt.Sprintf("%.1fK", value)
+	return strings.Replace(text, ".0K", "K", 1)
+}
+
+// formatContextWindow renders a model's context window for the title bar
+// (200000 → 200K, 1048576 → 1M).
+func formatContextWindow(window int) string {
+	if window <= 0 {
+		return ""
+	}
+	if window >= 1_000_000 && window%1_000_000 < 100_000 {
+		return strconv.Itoa(window/1_000_000) + "M"
+	}
+	return strconv.Itoa(window/1000) + "K"
 }
 
 func shortenPath(path string) string {
@@ -162,21 +224,16 @@ func shortenPath(path string) string {
 		return "unknown"
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		if strings.HasPrefix(path, home) {
+		// Match on a path boundary: a bare prefix check would mangle siblings
+		// like /Users/alice2 when home is /Users/alice.
+		if path == home {
+			return "~"
+		}
+		if strings.HasPrefix(path, home+string(os.PathSeparator)) {
 			return "~" + path[len(home):]
 		}
 	}
 	return path
-}
-
-func nonEmpty(values []string) []string {
-	out := values[:0]
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			out = append(out, value)
-		}
-	}
-	return out
 }
 
 // gitBranch reads the current branch (or short SHA when detached) for cwd, handling
@@ -220,10 +277,10 @@ func gitBranch(cwd string) string {
 	return ref
 }
 
-// suggestionOverlay renders the slash-command autocomplete list below the input
-// in the default skin: one row per match (name + dim description), the selected
-// row highlighted with a caret and the accent color. Returns "" when no overlay
-// should show.
+// suggestionOverlay renders the slash-command autocomplete list below the
+// composer: one row per match on the panel surface, the selected row on the
+// selection tint with an accent ❯ marker. Returns "" when no overlay should
+// show.
 func (m model) suggestionOverlay(width int) string {
 	if !m.suggestionsActive() {
 		return ""
@@ -236,35 +293,54 @@ func (m model) suggestionOverlay(width int) string {
 	}
 	lines := make([]string, 0, len(m.suggestions))
 	for index, s := range m.suggestions {
-		pad := strings.Repeat(" ", maxInt(0, nameWidth-lipgloss.Width(s.Name)))
-		marker := "  "
-		name := zeroTheme.text.Render(s.Name)
+		surface := zeroTheme.onPanel
+		marker := surface(zeroTheme.faintest).Render("  ")
 		if index == m.suggestionIdx {
-			marker = zeroTheme.accent.Render("› ")
-			name = zeroTheme.accent.Render(s.Name)
+			surface = zeroTheme.onSel
+			marker = surface(zeroTheme.accent).Render("❯ ")
 		}
-		line := marker + name + pad + "  " + zeroTheme.muted.Render(s.Desc)
+		pad := surface(zeroTheme.ink).Render(strings.Repeat(" ", maxInt(0, nameWidth-lipgloss.Width(s.Name))))
+		line := marker + surface(zeroTheme.ink).Render(s.Name) + pad + surface(zeroTheme.faint).Render("  "+s.Desc)
 		lines = append(lines, fitStyledLine(line, width-2))
 	}
 	return strings.Join(lines, "\n")
 }
 
-// pickerOverlay renders an open interactive selector below the input in the
-// default skin: a titled bordered list with the selected row highlighted.
+// pickerOverlay renders an open interactive selector below the composer: a
+// bordered panel with a title-and-hints row, rows carrying a provider dot and
+// right metadata when the catalog exposes them, and the selected row on the
+// selection tint.
 func (m model) pickerOverlay(width int) string {
 	if m.picker == nil {
 		return ""
 	}
+	innerWidth := width - 4
 	lines := make([]string, 0, len(m.picker.items)+1)
-	lines = append(lines, zeroTheme.accent.Render(m.picker.title)+zeroTheme.muted.Render("  ↑/↓ move · ⏎ select · esc cancel"))
+	lines = append(lines, zeroTheme.ink.Render(m.picker.title)+zeroTheme.faint.Render("  ↑/↓ · ⏎ · esc"))
 	for index, item := range m.picker.items {
-		marker := "  "
-		label := zeroTheme.text.Render(item.Label)
+		surface := zeroTheme.onPanel2
+		marker := surface(zeroTheme.faintest).Render("  ")
 		if index == m.picker.selected {
-			marker = zeroTheme.accent.Render("› ")
-			label = zeroTheme.accent.Render(item.Label)
+			surface = zeroTheme.onSel
+			marker = surface(zeroTheme.accent).Render("❯ ")
 		}
-		lines = append(lines, fitStyledLine(marker+label, width-4))
+		left := marker
+		switch {
+		case item.Local:
+			left += surface(zeroTheme.blue).Render("● ")
+		case item.Remote:
+			left += surface(zeroTheme.accent).Render("● ")
+		}
+		left += surface(zeroTheme.ink).Render(item.Label)
+		right := ""
+		if item.Meta != "" {
+			right = surface(zeroTheme.faintest).Render(item.Meta)
+		}
+		// Paint the gap on the row surface so selected rows read as one solid
+		// band; joinHeaderLine would pad with bare (untinted) spaces.
+		gap := innerWidth - lipgloss.Width(left) - lipgloss.Width(right)
+		line := left + surface(zeroTheme.ink).Render(strings.Repeat(" ", maxInt(1, gap))) + right
+		lines = append(lines, fitStyledLine(line, innerWidth))
 	}
 	return borderedBlock(width, lines)
 }
@@ -272,6 +348,22 @@ func (m model) pickerOverlay(width int) string {
 // argHint extracts the most representative argument from a tool call's raw JSON
 // arguments for the single-line tool row (the path, pattern, or command acted on).
 func argHint(raw string) string {
+	return firstArgValue(raw, []string{"path", "file", "file_path", "filepath", "pattern", "query", "command", "cmd", "url"})
+}
+
+// argHintSecondary extracts the card head's faintest arg column: the
+// non-target argument (pattern/query/command) when argHint already resolved to
+// a path. With no path argument the value is argHint itself, so it stays in
+// the target slot and this returns "".
+func argHintSecondary(raw string) string {
+	secondary := firstArgValue(raw, []string{"pattern", "query", "command", "cmd", "url"})
+	if secondary == "" || secondary == argHint(raw) {
+		return ""
+	}
+	return secondary
+}
+
+func firstArgValue(raw string, keys []string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "{}" {
 		return ""
@@ -280,7 +372,7 @@ func argHint(raw string) string {
 	if err := json.Unmarshal([]byte(raw), &args); err != nil {
 		return ""
 	}
-	for _, key := range []string{"path", "file", "file_path", "filepath", "pattern", "query", "command", "cmd", "url"} {
+	for _, key := range keys {
 		if value, ok := args[key]; ok {
 			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
 				return strings.TrimSpace(text)
@@ -299,78 +391,29 @@ func indentText(text string, spaces int) string {
 	return strings.Join(lines, "\n")
 }
 
-// looksLikeDiff reports whether output should be rendered as a diff card.
+// looksLikeDiff reports whether output should be rendered as a diff card: a
+// real hunk header, or both old/new file headers. A single line starting with
+// "---" (a Markdown rule, YAML document marker, log separator…) must NOT
+// hijack ordinary bash/tool output into the diff renderer.
 func looksLikeDiff(text string) bool {
 	if !strings.Contains(text, "\n") {
 		return false
 	}
+	hasOld, hasNew := false, false
 	for _, line := range strings.Split(text, "\n") {
-		if strings.HasPrefix(line, "@@") || strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
+		switch {
+		case hunkHeaderPattern.MatchString(line):
+			return true
+		case strings.HasPrefix(line, "+++ "):
+			hasNew = true
+		case strings.HasPrefix(line, "--- "):
+			hasOld = true
+		}
+		if hasOld && hasNew {
 			return true
 		}
 	}
 	return false
-}
-
-func colorizeDiffLine(line string) string {
-	switch {
-	case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"), strings.HasPrefix(line, "@@"):
-		return zeroTheme.diffMeta.Render(line)
-	case strings.HasPrefix(line, "+"):
-		return zeroTheme.diffAdd.Render(line)
-	case strings.HasPrefix(line, "-"):
-		return zeroTheme.diffDel.Render(line)
-	default:
-		return zeroTheme.muted.Render(line)
-	}
-}
-
-const diffCardMaxLines = 16
-
-func diffCard(title string, detail string, width int) string {
-	budget := width - 4
-	if budget < 16 {
-		budget = 16
-	}
-	rawLines := strings.Split(strings.ReplaceAll(detail, "\r\n", "\n"), "\n")
-	body := make([]string, 0, len(rawLines))
-	for _, line := range rawLines {
-		line = truncateRunes(line, budget)
-		body = append(body, colorizeDiffLine(line))
-	}
-	if len(body) > diffCardMaxLines {
-		hidden := len(body) - diffCardMaxLines
-		body = body[:diffCardMaxLines]
-		body = append(body, zeroTheme.muted.Render(fmt.Sprintf("… %d more lines", hidden)))
-	}
-	return titledCard("edit · "+title, body, width)
-}
-
-// titledCard draws a rounded box with a title embedded in the top border.
-func titledCard(title string, body []string, width int) string {
-	if width < 24 {
-		width = 24
-	}
-	remaining := width - 5 - lipgloss.Width(title)
-	if remaining < 0 {
-		remaining = 0
-	}
-	top := zeroTheme.border.Render("╭─ ") +
-		zeroTheme.text.Render(title) +
-		zeroTheme.border.Render(" "+strings.Repeat("─", remaining)+"╮")
-
-	lines := make([]string, 0, len(body)+2)
-	lines = append(lines, top)
-	budget := width - 4
-	for _, line := range body {
-		pad := budget - lipgloss.Width(line)
-		if pad < 0 {
-			pad = 0
-		}
-		lines = append(lines, zeroTheme.border.Render("│ ")+line+strings.Repeat(" ", pad)+zeroTheme.border.Render(" │"))
-	}
-	lines = append(lines, zeroTheme.border.Render("╰"+strings.Repeat("─", width-2)+"╯"))
-	return strings.Join(lines, "\n")
 }
 
 func truncateRunes(text string, limit int) string {
