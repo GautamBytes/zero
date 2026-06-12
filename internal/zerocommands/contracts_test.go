@@ -324,3 +324,40 @@ func TestSessionTreeSnapshotConvertsChildren(t *testing.T) {
 		t.Fatalf("child lineage not preserved in tree snapshot: %#v", snapshot)
 	}
 }
+
+func TestProviderSnapshotAPIKeySetCountsAuthHeaderValue(t *testing.T) {
+	cases := []struct {
+		name    string
+		profile config.ProviderProfile
+		want    bool
+	}{
+		{"api key only", config.ProviderProfile{Name: "p", APIKey: "sk-x"}, true},
+		{"auth header only", config.ProviderProfile{Name: "p", AuthHeaderValue: "Bearer t"}, true},
+		{"both", config.ProviderProfile{Name: "p", APIKey: "sk-x", AuthHeaderValue: "Bearer t"}, true},
+		{"neither", config.ProviderProfile{Name: "p"}, false},
+		{"whitespace api key only", config.ProviderProfile{Name: "p", APIKey: "   "}, false},
+		{"whitespace auth header only", config.ProviderProfile{Name: "p", AuthHeaderValue: "   "}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := ProviderSnapshotFromProfile(tc.profile, false)
+			if snapshot.APIKeySet != tc.want {
+				t.Fatalf("APIKeySet = %v, want %v", snapshot.APIKeySet, tc.want)
+			}
+		})
+	}
+}
+
+func TestProviderSnapshotRedactsAuthHeaderValueInBaseURL(t *testing.T) {
+	// A raw auth-header value that leaks into the base URL must be redacted too,
+	// not just APIKey.
+	const secret = "authhdr-secret-9f8e7d6c5b"
+	snapshot := ProviderSnapshotFromProfile(config.ProviderProfile{
+		Name:            "p",
+		BaseURL:         "https://api.test/v1?token=" + secret,
+		AuthHeaderValue: secret,
+	}, false)
+	if strings.Contains(snapshot.BaseURL, secret) {
+		t.Fatalf("auth-header value leaked into base URL: %q", snapshot.BaseURL)
+	}
+}
