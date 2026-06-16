@@ -559,6 +559,10 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.copyStatus = ""
 		}
 		return m, nil
+	case providerWizardOAuthMsg:
+		return m.applyProviderWizardOAuth(msg)
+	case providerWizardDeviceCodeMsg:
+		return m.applyProviderWizardDeviceCode(msg)
 	case tea.KeyMsg:
 		if m.setup.visible {
 			return m.handleSetupKey(msg)
@@ -1120,6 +1124,10 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyProviderModelsDiscovered(msg), nil
 	case setupModelsDiscoveredMsg:
 		return m.applySetupModelsDiscovered(msg), nil
+	case setupOAuthMsg:
+		return m.applySetupOAuth(msg)
+	case setupOAuthDeviceMsg:
+		return m.applySetupOAuthDeviceCode(msg)
 	case modelPickerModelsDiscoveredMsg:
 		return m.applyModelPickerModelsDiscovered(msg), nil
 	case mcpCommandResultMsg:

@@ -11,9 +11,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Gitlawb/zero/internal/browser"
 	"github.com/Gitlawb/zero/internal/config"
+	"github.com/Gitlawb/zero/internal/oauth"
 	"github.com/Gitlawb/zero/internal/providercatalog"
 	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
+	"github.com/Gitlawb/zero/internal/provideroauth"
 	"github.com/Gitlawb/zero/internal/redaction"
 )
 
@@ -21,6 +24,7 @@ type setupStage int
 
 const (
 	setupStageWelcome setupStage = iota
+	setupStageMethod
 	setupStageProvider
 	setupStageEndpoint
 	setupStageName
@@ -31,24 +35,54 @@ const (
 )
 
 type setupState struct {
-	visible    bool
-	required   bool
-	configPath string
-	providers  []SetupProviderOption
-	selected   int
-	stage      setupStage
-	err        string
-	baseURL    string
-	name       string
-	apiKey     textinput.Model
-	models     []providerWizardModel
-	modelIndex int
-	modelQuery string
-	modelForID string
-	modelLoad  bool
-	modelErr   string
-	modelSrc   string
-	modelGen   uint64
+	visible        bool
+	required       bool
+	configPath     string
+	providers      []SetupProviderOption // active list (full, or OAuth-only after the chooser)
+	allProviders   []SetupProviderOption // full catalog (restored when leaving the OAuth path)
+	selected       int
+	selectedMethod int
+	oauthMode      bool
+	oauthPending   bool
+	oauthErr       string
+	// Device-code login (RFC 8628) state while an OAuth login is in flight.
+	oauthDevice           bool
+	deviceUserCode        string
+	deviceVerificationURI string
+	stage                 setupStage
+	err                   string
+	baseURL               string
+	name                  string
+	apiKey                textinput.Model
+	models                []providerWizardModel
+	modelIndex            int
+	modelQuery            string
+	modelForID            string
+	modelLoad             bool
+	modelErr              string
+	modelSrc              string
+	modelGen              uint64
+}
+
+// setupOAuthMsg carries the result of a first-run browser OAuth login.
+type setupOAuthMsg struct {
+	apiKey     string
+	tokenLogin bool
+	providerID string
+	err        error
+}
+
+// setupOAuthProviderOptions filters the full provider list to the OAuth-capable
+// ones for the OAuth method path. ChatGPT/Claude are not here — they can't do
+// real in-app OAuth (use "browse" + a local proxy); see docs/oauth-subscriptions.md.
+func setupOAuthProviderOptions(all []SetupProviderOption) []SetupProviderOption {
+	out := []SetupProviderOption{}
+	for _, option := range all {
+		if descriptor, ok := providercatalog.Get(option.ID); ok && descriptor.OAuth {
+			out = append(out, option)
+		}
+	}
+	return out
 }
 
 type setupModelsDiscoveredMsg struct {
@@ -83,16 +117,29 @@ func newSetupState(options SetupOptions) setupState {
 	apiKey.KeyMap.Paste.SetEnabled(false)
 	apiKey.Focus()
 	return setupState{
-		visible:    options.Visible,
-		required:   options.Required,
-		configPath: strings.TrimSpace(options.ConfigPath),
-		providers:  providers,
-		apiKey:     apiKey,
+		visible:      options.Visible,
+		required:     options.Required,
+		configPath:   strings.TrimSpace(options.ConfigPath),
+		providers:    providers,
+		allProviders: providers,
+		apiKey:       apiKey,
 	}
 }
 
 func (m model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.clearMouseSelection()
+	// While a browser OAuth login is in flight, ignore input except Ctrl+C (quit)
+	// and Esc (cancel back to the OAuth provider list).
+	if m.setup.oauthPending {
+		switch msg.Type {
+		case tea.KeyCtrlC:
+			return m, tea.Quit
+		case tea.KeyEsc:
+			m.setup.oauthPending = false
+			m.setup.oauthDevice = false
+		}
+		return m, nil
+	}
 	if m.setupEndpointInputActive() {
 		return m.handleSetupEndpointKey(msg)
 	}
@@ -107,7 +154,11 @@ func (m model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case tea.KeyEsc:
 		if m.setup.stage > setupStageWelcome {
-			m.setup.stage = m.previousSetupStage()
+			prev := m.previousSetupStage()
+			if prev == setupStageMethod {
+				m = m.setupReturnToMethod()
+			}
+			m.setup.stage = prev
 			m.setup.err = ""
 			return m, nil
 		}
@@ -117,12 +168,16 @@ func (m model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.exitSetupToChat()
 	case tea.KeyLeft:
 		if m.setup.stage > setupStageWelcome {
-			m.setup.stage = m.previousSetupStage()
+			prev := m.previousSetupStage()
+			if prev == setupStageMethod {
+				m = m.setupReturnToMethod()
+			}
+			m.setup.stage = prev
 			m.setup.err = ""
 		}
 		return m, nil
 	case tea.KeyEnter:
-		if m.setup.stage == setupStageProvider || m.setup.stage == setupStageModel || m.setup.stage == setupStageReady {
+		if m.setup.stage == setupStageMethod || m.setup.stage == setupStageProvider || m.setup.stage == setupStageModel || m.setup.stage == setupStageReady {
 			return m.advanceSetup()
 		}
 		return m, nil
@@ -132,14 +187,18 @@ func (m model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyUp:
-		if m.setup.stage == setupStageProvider {
+		if m.setup.stage == setupStageMethod {
+			m.moveSetupMethod(-1)
+		} else if m.setup.stage == setupStageProvider {
 			m.moveSetupProvider(-1)
 		} else if m.setup.stage == setupStageModel {
 			m.moveSetupModel(-1)
 		}
 		return m, nil
 	case tea.KeyDown:
-		if m.setup.stage == setupStageProvider {
+		if m.setup.stage == setupStageMethod {
+			m.moveSetupMethod(1)
+		} else if m.setup.stage == setupStageProvider {
 			m.moveSetupProvider(1)
 		} else if m.setup.stage == setupStageModel {
 			m.moveSetupModel(1)
@@ -160,6 +219,11 @@ func (m model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "j":
 			if m.setup.stage == setupStageProvider {
 				m.moveSetupProvider(1)
+			}
+		case "d", "D":
+			// Force device-code login for a device-capable OAuth provider.
+			if m.setup.stage == setupStageProvider && m.setup.oauthMode && m.setupProviderDescriptor().OAuthDeviceFlow {
+				return m.startSetupDeviceLogin(m.setupProviderDescriptor())
 			}
 		}
 		return m, nil
@@ -200,6 +264,9 @@ func (m model) handleSetupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleSetupMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.setup.oauthPending {
+		return m, nil
+	}
 	if mouseLeftPress(msg) {
 		switch m.setup.stage {
 		case setupStageProvider:
@@ -323,12 +390,178 @@ func setupContentTop(height int, contentLines int, hasError bool) int {
 }
 
 func (m model) setupStages() []setupStage {
-	stages := []setupStage{setupStageWelcome, setupStageProvider}
+	stages := []setupStage{setupStageWelcome, setupStageMethod}
+	if m.setup.oauthMode {
+		// OAuth path skips endpoint/name/credentials (the login provides the credential).
+		return append(stages, setupStageProvider, setupStageModel, setupStageSafety, setupStageReady)
+	}
+	stages = append(stages, setupStageProvider)
 	if setupProviderNeedsEndpoint(m.setupProvider()) {
 		stages = append(stages, setupStageEndpoint, setupStageName)
 	}
 	stages = append(stages, setupStageCredentials, setupStageModel, setupStageSafety, setupStageReady)
 	return stages
+}
+
+// setupReturnToMethod resets the OAuth selection when navigating back to the
+// connect-method chooser.
+func (m model) setupReturnToMethod() model {
+	m.setup.oauthMode = false
+	m.setup.oauthErr = ""
+	m.setup.oauthDevice = false
+	m.setup.deviceUserCode = ""
+	m.setup.deviceVerificationURI = ""
+	m.setup.providers = m.setup.allProviders
+	m.setup.selected = 0
+	m.resetSetupModels()
+	return m
+}
+
+// setupMethodOptions returns the connect-method choices for this run, dropping the
+// OAuth option when this setup's own provider list has no OAuth-capable entry — so
+// the user can't pick OAuth and land on an empty provider list.
+func (m model) setupMethodOptions() []providerWizardMethodOption {
+	options := providerWizardMethodOptions()
+	if len(setupOAuthProviderOptions(m.setup.allProviders)) > 0 {
+		return options
+	}
+	filtered := make([]providerWizardMethodOption, 0, len(options))
+	for _, option := range options {
+		if option.oauth {
+			continue
+		}
+		filtered = append(filtered, option)
+	}
+	return filtered
+}
+
+func (m *model) moveSetupMethod(delta int) {
+	options := m.setupMethodOptions()
+	if len(options) == 0 {
+		return
+	}
+	m.setup.selectedMethod = ((m.setup.selectedMethod+delta)%len(options) + len(options)) % len(options)
+}
+
+// setupOAuthCmd runs the chosen provider's browser OAuth login off the UI
+// goroutine for first-run setup. Mirrors the /provider wizard's flow.
+func setupOAuthCmd(provider providercatalog.Descriptor) tea.Cmd {
+	if provider.OAuthMintsKey {
+		return func() tea.Msg {
+			key, err := provideroauth.OpenRouterLogin(context.Background(), provideroauth.OpenRouterOptions{
+				OpenBrowser: browser.OpenURL,
+				Timeout:     3 * time.Minute,
+			})
+			return setupOAuthMsg{apiKey: key, providerID: provider.ID, err: err}
+		}
+	}
+	name := provider.ID
+	return func() tea.Msg {
+		return setupOAuthMsg{tokenLogin: true, providerID: name, err: runProviderTokenLogin(name)}
+	}
+}
+
+// setupOAuthDeviceMsg carries phase 1 of device-code login (RequestDeviceCode)
+// for first-run setup: the user_code + verification URI to display.
+type setupOAuthDeviceMsg struct {
+	providerID string
+	userCode   string
+	verifyURL  string
+	cfg        oauth.Config
+	auth       oauth.DeviceAuth
+	err        error
+}
+
+func setupDevicePrepareCmd(name string) tea.Cmd {
+	return func() tea.Msg {
+		auth, cfg, err := oauthDevicePrepare(name)
+		if err != nil {
+			return setupOAuthDeviceMsg{providerID: name, err: err}
+		}
+		return setupOAuthDeviceMsg{
+			providerID: name,
+			userCode:   auth.UserCode,
+			verifyURL:  oauthDeviceVerifyTarget(auth),
+			cfg:        cfg,
+			auth:       auth,
+		}
+	}
+}
+
+func setupDevicePollCmd(name string, cfg oauth.Config, auth oauth.DeviceAuth) tea.Cmd {
+	return func() tea.Msg {
+		return setupOAuthMsg{tokenLogin: true, providerID: name, err: oauthDeviceComplete(name, cfg, auth)}
+	}
+}
+
+// startSetupDeviceLogin begins the device-code flow for the selected OAuth
+// provider during first-run setup (phase 1).
+func (m model) startSetupDeviceLogin(descriptor providercatalog.Descriptor) (tea.Model, tea.Cmd) {
+	if !descriptor.OAuth || !descriptor.OAuthDeviceFlow {
+		return m, nil
+	}
+	m.setup.oauthPending = true
+	m.setup.oauthDevice = true
+	m.setup.oauthErr = ""
+	m.setup.deviceUserCode = ""
+	m.setup.deviceVerificationURI = ""
+	return m, setupDevicePrepareCmd(descriptor.ID)
+}
+
+// applySetupOAuthDeviceCode handles phase 1 of device-code login: show the code,
+// then start phase 2 (the token poll). On error the redacted message is shown.
+func (m model) applySetupOAuthDeviceCode(msg setupOAuthDeviceMsg) (tea.Model, tea.Cmd) {
+	if !m.setup.visible || !m.setup.oauthPending {
+		return m, nil
+	}
+	// Ignore a stale result from a login the user has since replaced with a
+	// different provider (an in-flight prepare landing after the switch).
+	if msg.providerID != "" && msg.providerID != m.setupProviderDescriptor().ID {
+		return m, nil
+	}
+	if msg.err != nil {
+		m.setup.oauthPending = false
+		m.setup.oauthDevice = false
+		m.setup.oauthErr = redaction.RedactString(msg.err.Error(), redaction.Options{})
+		return m, nil
+	}
+	m.setup.deviceUserCode = msg.userCode
+	m.setup.deviceVerificationURI = msg.verifyURL
+	return m, setupDevicePollCmd(msg.providerID, msg.cfg, msg.auth)
+}
+
+// applySetupOAuth folds an OAuth login result into the first-run setup: on success
+// the credential is captured (minted key) or relied upon (stored token) and setup
+// jumps to model selection; on failure the redacted error is shown.
+func (m model) applySetupOAuth(msg setupOAuthMsg) (tea.Model, tea.Cmd) {
+	if !m.setup.visible || !m.setup.oauthPending {
+		return m, nil
+	}
+	// Ignore a stale result for a provider the user has since switched away from,
+	// so a late login can't capture a credential against the wrong provider.
+	if msg.providerID != "" && msg.providerID != m.setupProviderDescriptor().ID {
+		return m, nil
+	}
+	m.setup.oauthPending = false
+	if msg.err != nil {
+		m.setup.oauthErr = redaction.RedactString(msg.err.Error(), redaction.Options{})
+		return m, nil
+	}
+	if msg.apiKey != "" {
+		m.setup.apiKey.SetValue(msg.apiKey)
+	}
+	m.setup.oauthErr = ""
+	m.setup.err = ""
+	m.setup.oauthDevice = false
+	m.setup.deviceUserCode = ""
+	m.setup.deviceVerificationURI = ""
+	m.setup.stage = setupStageModel
+	m.resetSetupModels()
+	m.setup.modelErr = ""
+	m.setup.modelGen++
+	cmd := m.setupModelDiscoveryCmd(m.setup.modelGen)
+	m.setup.modelLoad = cmd != nil
+	return m, cmd
 }
 
 func (m model) nextSetupStage() setupStage {
@@ -367,6 +600,37 @@ func setupBlockContainsMouseX(x int, width int, blockWidth int) bool {
 
 func (m model) advanceSetup() (tea.Model, tea.Cmd) {
 	if m.setup.stage < setupStageReady {
+		if m.setup.stage == setupStageMethod {
+			options := m.setupMethodOptions()
+			m.setup.selectedMethod = clamp(m.setup.selectedMethod, 0, maxInt(0, len(options)-1))
+			if len(options) > 0 && options[m.setup.selectedMethod].oauth {
+				m.setup.oauthMode = true
+				m.setup.providers = setupOAuthProviderOptions(m.setup.allProviders)
+			} else {
+				m.setup.oauthMode = false
+				m.setup.providers = m.setup.allProviders
+			}
+			m.setup.selected = 0
+			m.resetSetupModels()
+			m.setup.stage = setupStageProvider
+			m.setup.err = ""
+			return m, nil
+		}
+		// OAuth path: advancing from the OAuth provider list starts the browser login.
+		if m.setup.stage == setupStageProvider && m.setup.oauthMode {
+			descriptor := m.setupProviderDescriptor()
+			if descriptor.OAuth {
+				// Headless/SSH boxes can't open a browser — use device code there
+				// by default (the user can also force it with "d" from the list).
+				if descriptor.OAuthDeviceFlow && oauthPreferDeviceFlow() {
+					return m.startSetupDeviceLogin(descriptor)
+				}
+				m.setup.oauthPending = true
+				m.setup.oauthDevice = false
+				m.setup.oauthErr = ""
+				return m, setupOAuthCmd(descriptor)
+			}
+		}
 		if m.setup.stage == setupStageProvider {
 			m.setup.apiKey.SetValue("")
 			m.setup.baseURL = ""
@@ -427,12 +691,21 @@ func (m model) completeSetup() (tea.Model, tea.Cmd) {
 		return m.exitSetupToChat()
 	}
 
+	name := m.setupProfileName(option)
+	apiKey := m.setupCredentialAPIKey(option)
+	// OAuth token login (e.g. xAI): the credential is the OAuth token stored under
+	// provider:<id>; name the profile after the provider id so the runtime resolver
+	// attaches the bearer, and store no API key.
+	if m.setup.oauthMode && !m.setupProviderDescriptor().OAuthMintsKey {
+		name = option.ID
+		apiKey = ""
+	}
 	result, err := m.setupSave(SetupSelection{
 		CatalogID: option.ID,
-		Name:      m.setupProfileName(option),
+		Name:      name,
 		BaseURL:   m.setupBaseURL(option),
 		Model:     m.setupCurrentModel().ID,
-		APIKey:    m.setupCredentialAPIKey(option),
+		APIKey:    apiKey,
 	})
 	if err != nil {
 		m.setup.err = err.Error()
@@ -488,8 +761,12 @@ func (m model) setupModelDiscoveryCmd(gen uint64) tea.Cmd {
 	if setupProviderUsesTypedModel(option) {
 		return nil
 	}
-	profile := providerWizardDiscoveryProfile(provider, m.setupCredentialAPIKey(option))
-	redactionSecrets := []string{m.setup.apiKey.Value(), profile.APIKey}
+	pastedKey := m.setupCredentialAPIKey(option)
+	// A token-login provider (e.g. xAI) keeps its bearer in the OAuth store, not as
+	// a pasted key; resolve it so /models is authenticated and the live list shows
+	// after sign-in. (OpenRouter mints a key into the credential already.)
+	needOAuthToken := strings.TrimSpace(pastedKey) == "" && provider.OAuth && !provider.OAuthMintsKey
+	baseSecrets := []string{m.setup.apiKey.Value()}
 	discover := m.discoverProviderModels
 	if discover == nil {
 		discover = func(ctx context.Context, profile config.ProviderProfile) ([]providermodeldiscovery.Model, error) {
@@ -498,10 +775,18 @@ func (m model) setupModelDiscoveryCmd(gen uint64) tea.Cmd {
 	}
 	providerID := provider.ID
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(m.ctx, 8*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 12*time.Second)
 		defer cancel()
+		apiKey := pastedKey
+		if needOAuthToken {
+			if resolved := oauthStoredToken(ctx, providerID); resolved != "" {
+				apiKey = resolved
+			}
+		}
+		profile := providerWizardDiscoveryProfile(provider, apiKey)
+		secrets := append(append([]string{}, baseSecrets...), apiKey, profile.APIKey)
 		models, err := discover(ctx, profile)
-		return setupModelsDiscoveredMsg{providerID: providerID, gen: gen, redactionSecrets: redactionSecrets, models: models, err: err}
+		return setupModelsDiscoveredMsg{providerID: providerID, gen: gen, redactionSecrets: secrets, models: models, err: err}
 	}
 }
 
@@ -849,7 +1134,12 @@ func (m model) setupView(width int) string {
 }
 
 func (m model) setupStageLines(width int, height int) []string {
+	if m.setup.oauthPending {
+		return m.setupOAuthWaitingLines(width)
+	}
 	switch m.setup.stage {
+	case setupStageMethod:
+		return m.setupMethodLines(width)
 	case setupStageProvider:
 		return m.setupProviderLines(width, height)
 	case setupStageEndpoint:
@@ -1089,6 +1379,69 @@ func setupModelSelectedDetail(model providerWizardModel) string {
 	return strings.Join(parts, " · ")
 }
 
+func (m model) setupMethodLines(width int) []string {
+	options := m.setupMethodOptions()
+	rowWidth := setupMethodBlockWidth(width, options)
+	idx := clamp(m.setup.selectedMethod, 0, maxInt(0, len(options)-1))
+	lines := []string{
+		padSetupLine("  "+zeroTheme.ink.Bold(true).Render("How do you want to connect?"), rowWidth),
+		blankSetupBlockLine(rowWidth),
+	}
+	for index, option := range options {
+		marker := "  "
+		style := zeroTheme.ink
+		if index == idx {
+			marker = "❯ "
+			style = zeroTheme.accent.Bold(true)
+		}
+		lines = append(lines, padSetupLine(marker+style.Render(option.label), rowWidth))
+		lines = append(lines, padSetupLine("    "+zeroTheme.faint.Render(option.subtitle), rowWidth))
+	}
+	return lines
+}
+
+func setupMethodBlockWidth(terminalWidth int, options []providerWizardMethodOption) int {
+	available := maxInt(34, minInt(terminalWidth-8, 86))
+	target := lipgloss.Width("  How do you want to connect?")
+	for _, option := range options {
+		target = maxInt(target, 2+lipgloss.Width(option.label))
+		target = maxInt(target, 4+lipgloss.Width(option.subtitle))
+	}
+	return minInt(maxInt(target, 42), available)
+}
+
+func (m model) setupOAuthWaitingLines(width int) []string {
+	provider := m.setupProviderDescriptor()
+	name := displayValue(provider.Name, provider.ID)
+	var lines []string
+	if m.setup.oauthDevice {
+		lines = []string{zeroTheme.ink.Bold(true).Render("Device-code sign-in for " + name), ""}
+		if m.setup.deviceUserCode == "" {
+			lines = append(lines, zeroTheme.faint.Render("Requesting a device code..."))
+		} else {
+			lines = append(lines,
+				"1. On any device, visit:  "+zeroTheme.accent.Render(m.setup.deviceVerificationURI),
+				"2. Enter the code:  "+zeroTheme.accent.Bold(true).Render(m.setup.deviceUserCode),
+				"",
+				zeroTheme.faint.Render("Waiting for authorization..."),
+			)
+		}
+	} else {
+		lines = []string{
+			zeroTheme.ink.Bold(true).Render("Signing in with " + name),
+			"",
+			"Opening your browser — approve there, then return here.",
+			zeroTheme.faint.Render("Waiting for authorization..."),
+			"",
+			zeroTheme.faint.Render("If your browser didn't open, run:  " + providerWizardOAuthCLIHint(provider)),
+		}
+	}
+	if m.setup.oauthErr != "" {
+		lines = append(lines, "", zeroTheme.red.Render("Sign-in failed: "+m.setup.oauthErr))
+	}
+	return lines
+}
+
 func (m model) setupProviderLines(width int, height int) []string {
 	rowWidth := setupProviderBlockWidth(width, m.setup.providers)
 	maxVisible := setupProviderMaxVisible(height, len(m.setup.providers))
@@ -1108,6 +1461,15 @@ func (m model) setupProviderLines(width int, height int) []string {
 		}
 		line := marker + style.Render(displayValue(option.Name, option.ID))
 		lines = append(lines, padSetupLine(line, rowWidth))
+	}
+	// A failed OAuth login drops back here with oauthPending cleared, so the
+	// waiting screen (which owns the error) is gone — surface it on the list the
+	// user lands on so the failure isn't silent and they can retry.
+	if m.setup.oauthMode && m.setup.oauthErr != "" {
+		lines = append(lines,
+			blankSetupBlockLine(rowWidth),
+			padSetupLine("  "+zeroTheme.red.Render("Sign-in failed: "+m.setup.oauthErr), rowWidth),
+		)
 	}
 	return lines
 }
@@ -1212,6 +1574,14 @@ func (m model) setupAPIKeyInputLine(width int) string {
 }
 
 func (m model) setupCredentialSummary(option SetupProviderOption) string {
+	// An OAuth token-login provider (e.g. xAI) is authenticated by a stored,
+	// refreshable token, not an API key — don't advertise an env var for it on the
+	// Ready screen. (Key-minting OAuth like OpenRouter still ends up as a saved key.)
+	if m.setup.oauthMode {
+		if d, ok := providercatalog.Get(option.ID); ok && d.OAuth && !d.OAuthMintsKey {
+			return "OAuth token"
+		}
+	}
 	if !setupProviderAcceptsAPIKey(option) {
 		return "not required"
 	}
@@ -1222,7 +1592,12 @@ func (m model) setupCredentialSummary(option SetupProviderOption) string {
 }
 
 func (m model) setupFooter() string {
+	if m.setup.oauthPending {
+		return zeroTheme.faint.Render("Esc cancel")
+	}
 	switch m.setup.stage {
+	case setupStageMethod:
+		return zeroTheme.faint.Render("↑/↓ choose   ") + zeroTheme.accent.Render("Enter") + zeroTheme.faint.Render(" continue   q quit")
 	case setupStageReady:
 		return zeroTheme.accent.Render("Enter") + zeroTheme.faint.Render(" to save and start chat")
 	case setupStageEndpoint:
@@ -1235,6 +1610,9 @@ func (m model) setupFooter() string {
 		}
 		return zeroTheme.accent.Render("Space") + zeroTheme.faint.Render(" to continue")
 	case setupStageProvider:
+		if m.setup.oauthMode && m.setupProviderDescriptor().OAuthDeviceFlow {
+			return zeroTheme.faint.Render("↑/↓ choose   ") + zeroTheme.accent.Render("Enter") + zeroTheme.faint.Render(" sign in   ") + zeroTheme.accent.Render("d") + zeroTheme.faint.Render(" device code   q quit")
+		}
 		return zeroTheme.faint.Render("↑/↓ choose   ") + zeroTheme.accent.Render("Enter") + zeroTheme.faint.Render(" continue   q quit")
 	case setupStageModel:
 		if m.setup.modelLoad {

@@ -13,6 +13,55 @@ import (
 	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
 )
 
+func TestSetupMethodOptionsDropsOAuthWithoutOAuthProviders(t *testing.T) {
+	build := func(providers []SetupProviderOption) model {
+		return newModel(context.Background(), Options{
+			Setup: SetupOptions{Visible: true, Providers: providers},
+		})
+	}
+
+	// This setup offers only non-OAuth providers, so the OAuth method must be
+	// hidden — otherwise selecting it lands the user on an empty provider list.
+	noOAuth := build([]SetupProviderOption{
+		{ID: "openai", Name: "OpenAI", EnvVar: "OPENAI_API_KEY", RequiresAuth: true},
+		{ID: "ollama", Name: "Ollama Local", Local: true},
+	})
+	for _, option := range noOAuth.setupMethodOptions() {
+		if option.oauth {
+			t.Fatal("OAuth method must be hidden when the setup has no OAuth providers")
+		}
+	}
+
+	// Add an OAuth-capable provider (xai) and the OAuth method returns.
+	withOAuth := build([]SetupProviderOption{
+		{ID: "xai", Name: "xAI"},
+		{ID: "openai", Name: "OpenAI", EnvVar: "OPENAI_API_KEY", RequiresAuth: true},
+	})
+	hasOAuth := false
+	for _, option := range withOAuth.setupMethodOptions() {
+		if option.oauth {
+			hasOAuth = true
+		}
+	}
+	if !hasOAuth {
+		t.Fatal("OAuth method must be offered when the setup has an OAuth provider")
+	}
+}
+
+func TestSetupCredentialSummaryOAuthToken(t *testing.T) {
+	m := newModel(context.Background(), Options{Setup: SetupOptions{Visible: true}})
+	m.setup.oauthMode = true
+	// xAI logs in with a stored, refreshable OAuth token (not key-minting), so the
+	// Ready screen must say "OAuth token", not advertise an env var.
+	if got := m.setupCredentialSummary(SetupProviderOption{ID: "xai", EnvVar: "XAI_API_KEY", RequiresAuth: true}); got != "OAuth token" {
+		t.Fatalf("xai OAuth summary = %q, want \"OAuth token\"", got)
+	}
+	// OpenRouter mints a normal API key via OAuth, so it must NOT be labeled a token.
+	if got := m.setupCredentialSummary(SetupProviderOption{ID: "openrouter", EnvVar: "OPENROUTER_API_KEY", RequiresAuth: true}); got == "OAuth token" {
+		t.Fatalf("openrouter (key-minting) should not show as OAuth token, got %q", got)
+	}
+}
+
 func TestSetupTakeoverRendersAndCompletes(t *testing.T) {
 	var saved SetupSelection
 	m := newModel(context.Background(), Options{
@@ -51,6 +100,12 @@ func TestSetupTakeoverRendersAndCompletes(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("setup navigation should not launch a command")
 	}
+	m = updated.(model)
+	if m.setup.stage != setupStageMethod {
+		t.Fatalf("stage = %v, want method chooser", m.setup.stage)
+	}
+	m.setup.selectedMethod = len(m.setupMethodOptions()) - 1 // API-key / browse path
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(model)
 	if m.setup.stage != setupStageProvider {
 		t.Fatalf("stage = %v, want provider", m.setup.stage)
@@ -1203,13 +1258,13 @@ func TestSetupProgressRendersAboveFooter(t *testing.T) {
 	stepIndex := -1
 	footerIndex := -1
 	for index, line := range lines {
-		if strings.Contains(line, "2/6") {
+		if strings.Contains(line, "3/7") {
 			stepIndex = index
 		}
 		if strings.Contains(line, "Enter continue") {
 			footerIndex = index
 		}
-		if strings.Contains(line, "Choose a provider") && strings.Contains(line, "2/6") {
+		if strings.Contains(line, "Choose a provider") && strings.Contains(line, "3/7") {
 			t.Fatalf("progress should not render in setup body: %q", line)
 		}
 	}
@@ -1243,10 +1298,151 @@ func TestSetupReadyFooterUsesEnter(t *testing.T) {
 	}
 }
 
+func TestSetupMethodChooserOAuthPath(t *testing.T) {
+	m := newModel(context.Background(), Options{Setup: SetupOptions{
+		Visible: true,
+		Providers: []SetupProviderOption{
+			{ID: "openrouter", Name: "OpenRouter", RequiresAuth: true, EnvVar: "OPENROUTER_API_KEY"},
+			{ID: "xai", Name: "xAI", RequiresAuth: true, EnvVar: "XAI_API_KEY"},
+			{ID: "openai", Name: "OpenAI", RequiresAuth: true, EnvVar: "OPENAI_API_KEY"},
+		},
+	}})
+	m.width = 100
+	m.height = 30
+
+	m = pressSetupContinueOnce(m) // Welcome → Method
+	if m.setup.stage != setupStageMethod {
+		t.Fatalf("stage = %v, want method chooser", m.setup.stage)
+	}
+	m.setup.selectedMethod = 0 // "Sign in with OAuth"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if m.setup.stage != setupStageProvider || !m.setup.oauthMode {
+		t.Fatalf("OAuth method should enter the OAuth provider list, got stage=%v oauth=%v", m.setup.stage, m.setup.oauthMode)
+	}
+	ids := map[string]bool{}
+	for _, p := range m.setup.providers {
+		ids[p.ID] = true
+	}
+	if len(m.setup.providers) != 2 || !ids["openrouter"] || !ids["xai"] {
+		t.Fatalf("OAuth provider list = %#v, want only openrouter+xai", m.setup.providers)
+	}
+
+	// Left returns to the method chooser and clears the OAuth selection.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = updated.(model)
+	if m.setup.stage != setupStageMethod || m.setup.oauthMode {
+		t.Fatalf("retreat should return to method without oauthMode, got stage=%v oauth=%v", m.setup.stage, m.setup.oauthMode)
+	}
+}
+
+func setupAtOAuthList(t *testing.T) model {
+	t.Helper()
+	m := newModel(context.Background(), Options{Setup: SetupOptions{
+		Visible: true,
+		Providers: []SetupProviderOption{
+			{ID: "openrouter", Name: "OpenRouter", RequiresAuth: true, EnvVar: "OPENROUTER_API_KEY"},
+			{ID: "xai", Name: "xAI", DefaultModel: "grok-4", RequiresAuth: true, EnvVar: "XAI_API_KEY"},
+		},
+	}})
+	m.width = 100
+	m.height = 30
+	m = pressSetupContinueOnce(m) // Welcome → Method
+	m.setup.selectedMethod = 0    // Sign in with OAuth
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	return updated.(model)
+}
+
+func TestSetupDeviceShortcutStartsDeviceFlow(t *testing.T) {
+	m := setupAtOAuthList(t)
+	for i, p := range m.setup.providers {
+		if p.ID == "xai" {
+			m.setup.selected = i
+			break
+		}
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	m = updated.(model)
+	if !m.setup.oauthPending || !m.setup.oauthDevice {
+		t.Fatalf("'d' should start device login (pending=%v device=%v)", m.setup.oauthPending, m.setup.oauthDevice)
+	}
+	if cmd == nil {
+		t.Fatal("'d' should return the device-prepare command")
+	}
+}
+
+func TestApplySetupOAuthDeviceCodeShowsCodeAndPolls(t *testing.T) {
+	m := setupAtOAuthList(t)
+	for i, p := range m.setup.providers {
+		if p.ID == "xai" {
+			m.setup.selected = i
+			break
+		}
+	}
+	m.setup.oauthPending = true
+	m.setup.oauthDevice = true
+
+	res, cmd := m.applySetupOAuthDeviceCode(setupOAuthDeviceMsg{
+		providerID: "xai", userCode: "WXYZ-9", verifyURL: "https://x.ai/device",
+	})
+	m = res.(model)
+	if m.setup.deviceUserCode != "WXYZ-9" || m.setup.deviceVerificationURI != "https://x.ai/device" {
+		t.Fatalf("device code not stored: %+v", m.setup)
+	}
+	if cmd == nil {
+		t.Fatal("device-code msg should start the poll command")
+	}
+	view := strings.Join(m.setupOAuthWaitingLines(72), "\n")
+	if !strings.Contains(view, "WXYZ-9") || !strings.Contains(view, "x.ai/device") {
+		t.Fatalf("waiting render missing device code/uri:\n%s", view)
+	}
+}
+
+func TestApplySetupOAuthSuccessAdvancesToModel(t *testing.T) {
+	m := newModel(context.Background(), Options{
+		DiscoverProviderModels: func(ctx context.Context, profile config.ProviderProfile) ([]providermodeldiscovery.Model, error) {
+			return nil, errors.New("offline")
+		},
+		Setup: SetupOptions{Visible: true, Providers: []SetupProviderOption{
+			{ID: "openrouter", Name: "OpenRouter", RequiresAuth: true, EnvVar: "OPENROUTER_API_KEY"},
+		}},
+	})
+	m.width = 100
+	m.height = 30
+	m = pressSetupContinueOnce(m) // Welcome → Method
+	m.setup.selectedMethod = 0
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model) // OAuth provider stage
+	m.setup.oauthPending = true
+
+	res, _ := m.applySetupOAuth(setupOAuthMsg{apiKey: "sk-or-minted", providerID: "openrouter"})
+	m = res.(model)
+	if m.setup.oauthPending {
+		t.Fatal("pending should clear after success")
+	}
+	if m.setup.stage != setupStageModel {
+		t.Fatalf("stage = %v, want model after OAuth", m.setup.stage)
+	}
+	if m.setup.apiKey.Value() != "sk-or-minted" {
+		t.Fatalf("minted key not captured: %q", m.setup.apiKey.Value())
+	}
+}
+
 func pressSetupContinue(m model) model {
+	m = pressSetupContinueOnce(m)
+	// Transparently skip the connect-method chooser via the API-key/browse path so
+	// existing tests keep their Welcome→Provider→… expectations.
+	if m.setup.stage == setupStageMethod {
+		m.setup.selectedMethod = len(m.setupMethodOptions()) - 1
+		m = pressSetupContinueOnce(m)
+	}
+	return m
+}
+
+func pressSetupContinueOnce(m model) model {
 	var updated tea.Model
 	var cmd tea.Cmd
-	if m.setup.stage == setupStageProvider || m.setupEndpointInputActive() || m.setupNameInputActive() || m.setupCredentialInputActive() || m.setup.stage == setupStageModel || m.setup.stage == setupStageReady {
+	if m.setup.stage == setupStageMethod || m.setup.stage == setupStageProvider || m.setupEndpointInputActive() || m.setupNameInputActive() || m.setupCredentialInputActive() || m.setup.stage == setupStageModel || m.setup.stage == setupStageReady {
 		updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	} else {
 		updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})

@@ -19,11 +19,28 @@ type providerModelsDiscoveredMsg struct {
 	token      int
 	models     []providermodeldiscovery.Model
 	err        error
+	// secrets are redacted from any surfaced error (e.g. a resolved OAuth token
+	// used to authenticate discovery, which must never be logged or shown).
+	secrets []string
 }
 
 func (m model) advanceProviderWizard() (model, tea.Cmd) {
 	if m.providerWizard == nil {
 		return m, nil
+	}
+	// OAuth path: advancing from the OAuth provider list starts the browser/device
+	// login instead of the key/endpoint flow.
+	if m.providerWizard.step == providerWizardStepProvider && m.providerWizard.oauthMode && m.providerWizard.currentProvider().OAuth {
+		provider := m.providerWizard.currentProvider()
+		// Headless/SSH boxes can't open a browser — use device code there by
+		// default (the user can also force it with "d" from the list).
+		if provider.OAuthDeviceFlow && oauthPreferDeviceFlow() {
+			return m.startProviderDeviceLogin()
+		}
+		m.providerWizard.oauthPending = true
+		m.providerWizard.oauthDevice = false
+		m.providerWizard.oauthErr = ""
+		return m, providerWizardOAuthCmdFor(provider)
 	}
 	previous := m.providerWizard.step
 	m.providerWizard.advance()
@@ -45,7 +62,11 @@ func (m model) providerModelDiscoveryCmd() tea.Cmd {
 	if providerWizardUsesTypedModel(provider) {
 		return nil
 	}
-	profile := providerWizardDiscoveryProfile(provider, wizard.apiKey)
+	pastedKey := wizard.apiKey
+	// A token-login provider (e.g. xAI) stores its bearer in the OAuth store, not
+	// as a pasted key; resolve it so /models is authenticated and the live list
+	// shows after sign-in. (OpenRouter mints a key into wizard.apiKey already.)
+	needOAuthToken := strings.TrimSpace(pastedKey) == "" && provider.OAuth && !provider.OAuthMintsKey
 	discover := m.discoverProviderModels
 	if discover == nil {
 		discover = func(ctx context.Context, profile config.ProviderProfile) ([]providermodeldiscovery.Model, error) {
@@ -59,10 +80,17 @@ func (m model) providerModelDiscoveryCmd() tea.Cmd {
 	token := wizard.discoveryToken
 	providerID := provider.ID
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(m.ctx, 8*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 12*time.Second)
 		defer cancel()
+		apiKey := pastedKey
+		if needOAuthToken {
+			if resolved := oauthStoredToken(ctx, providerID); resolved != "" {
+				apiKey = resolved
+			}
+		}
+		profile := providerWizardDiscoveryProfile(provider, apiKey)
 		models, err := discover(ctx, profile)
-		return providerModelsDiscoveredMsg{providerID: providerID, token: token, models: models, err: err}
+		return providerModelsDiscoveredMsg{providerID: providerID, token: token, models: models, err: err, secrets: []string{apiKey, profile.APIKey}}
 	}
 }
 
@@ -73,7 +101,7 @@ func (m model) applyProviderModelsDiscovered(msg providerModelsDiscoveredMsg) mo
 	}
 	wizard.modelLoading = false
 	if msg.err != nil {
-		wizard.modelLoadError = redaction.RedactString(msg.err.Error(), redaction.Options{ExtraSecretValues: []string{wizard.apiKey}})
+		wizard.modelLoadError = redaction.RedactString(msg.err.Error(), redaction.Options{ExtraSecretValues: append([]string{wizard.apiKey}, msg.secrets...)})
 		wizard.modelSource = "fallback"
 		wizard.refreshModels()
 		return m

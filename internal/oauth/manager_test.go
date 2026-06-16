@@ -106,6 +106,76 @@ func TestManagerLoginDevice(t *testing.T) {
 	}
 }
 
+func TestManagerPrepareAndCompleteDeviceLogin(t *testing.T) {
+	fp := newFakeProvider(t, `{"access_token":"two-phase-at","token_type":"Bearer","expires_in":3600}`)
+	env := map[string]string{
+		"ZERO_OAUTH_DEMO2_CLIENT_ID":  "client",
+		"ZERO_OAUTH_DEMO2_TOKEN_URL":  fp.server.URL + "/token",
+		"ZERO_OAUTH_DEMO2_DEVICE_URL": fp.server.URL + "/device",
+	}
+	m := managerFor(t, env, nil)
+
+	// Phase 1: request the device code (what the UI displays to the user).
+	auth, cfg, err := m.PrepareDeviceLogin(context.Background(), LoginOptions{Provider: "demo2"})
+	if err != nil {
+		t.Fatalf("PrepareDeviceLogin: %v", err)
+	}
+	if auth.UserCode != "U-1" || auth.VerificationURI == "" {
+		t.Fatalf("device auth missing user code/uri: %+v", auth)
+	}
+
+	// Phase 2: poll for the token and persist it.
+	status, err := m.CompleteDeviceLogin(context.Background(), "demo2", cfg, auth)
+	if err != nil {
+		t.Fatalf("CompleteDeviceLogin: %v", err)
+	}
+	if !status.HasToken || status.Key != ProviderKey("demo2") {
+		t.Fatalf("status = %+v", status)
+	}
+	access, err := m.GetFresh(context.Background(), ProviderKey("demo2"))
+	if err != nil {
+		t.Fatalf("GetFresh: %v", err)
+	}
+	if access != "two-phase-at" {
+		t.Fatalf("access = %q, want two-phase-at", access)
+	}
+}
+
+// A provider configured with only an issuer URL (no TOKEN_URL) must still be
+// refreshable: GetFresh resolves the token endpoint via discovery before
+// refreshing. Guards resolveConfigForKey calling resolveEndpoints.
+func TestManagerGetFreshDiscoversIssuerEndpoints(t *testing.T) {
+	var tokenHits int32
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"issuer":"`+server.URL+`","token_endpoint":"`+server.URL+`/token","authorization_endpoint":"`+server.URL+`/authorize"}`)
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&tokenHits, 1)
+		_, _ = io.WriteString(w, `{"access_token":"refreshed-at","token_type":"Bearer","expires_in":3600}`)
+	})
+	env := map[string]string{
+		"ZERO_OAUTH_ISSUERONLY_CLIENT_ID":  "client",
+		"ZERO_OAUTH_ISSUERONLY_ISSUER_URL": server.URL, // no TOKEN_URL → discovered
+	}
+	m := managerFor(t, env, nil)
+	if err := m.store.Save(ProviderKey("issueronly"), Token{AccessToken: "stale", RefreshToken: "rt", ExpiresAt: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	got, err := m.GetFresh(context.Background(), ProviderKey("issueronly"))
+	if err != nil {
+		t.Fatalf("GetFresh (issuer-only) must discover the token endpoint and refresh: %v", err)
+	}
+	if got != "refreshed-at" {
+		t.Fatalf("access = %q, want refreshed-at", got)
+	}
+	if atomic.LoadInt32(&tokenHits) == 0 {
+		t.Fatal("token endpoint never hit — discovery/refresh did not run")
+	}
+}
+
 func TestManagerGetFreshRefreshesExpired(t *testing.T) {
 	fp := newFakeProvider(t, `{"access_token":"fresh-at","expires_in":3600}`)
 	env := map[string]string{

@@ -33,6 +33,7 @@ var expectedCatalogIDs = []string{
 	"zai",
 	"gitlawb-opengateway",
 	"atomic-chat",
+	"chatgpt-proxy",
 	"custom-openai-compatible",
 	"custom-anthropic-compatible",
 }
@@ -220,7 +221,7 @@ func TestListByTransportPreservesCatalogOrder(t *testing.T) {
 		TransportBedrock:         {"bedrock"},
 		TransportVertex:          {"vertex"},
 		TransportAnthropicCompat: {"minimax", "custom-anthropic-compatible"},
-		TransportOpenAICompat:    {"ollama-cloud", "ollama", "lmstudio", "openrouter", "groq", "deepseek", "together", "dashscope", "moonshot", "nvidia-nim", "mistral", "github", "xai", "venice", "xiaomi-mimo", "bankr", "zai", "gitlawb-opengateway", "atomic-chat", "custom-openai-compatible"},
+		TransportOpenAICompat:    {"ollama-cloud", "ollama", "lmstudio", "openrouter", "groq", "deepseek", "together", "dashscope", "moonshot", "nvidia-nim", "mistral", "github", "xai", "venice", "xiaomi-mimo", "bankr", "zai", "gitlawb-opengateway", "atomic-chat", "chatgpt-proxy", "custom-openai-compatible"},
 	}
 
 	for transport, wantIDs := range cases {
@@ -274,6 +275,19 @@ func TestReturnedDescriptorsAreCopies(t *testing.T) {
 	}
 	if next.AuthEnvVars[0] != "OPENAI_API_KEY" {
 		t.Fatalf("descriptor slices are shared, got %q", next.AuthEnvVars[0])
+	}
+}
+
+func TestOAuthProviderClassification(t *testing.T) {
+	oauthIDs := descriptorIDs(OAuthProviders())
+	if want := []string{"openrouter", "xai"}; !reflect.DeepEqual(oauthIDs, want) {
+		t.Fatalf("OAuthProviders() = %#v, want %#v", oauthIDs, want)
+	}
+	if d, _ := Get("openrouter"); !d.OAuthMintsKey {
+		t.Fatal("openrouter should mint a key")
+	}
+	if d, _ := Get("xai"); !d.OAuthDeviceFlow {
+		t.Fatal("xai should advertise device-code flow")
 	}
 }
 
