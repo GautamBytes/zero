@@ -90,11 +90,48 @@ func toolFailureStopAnswer(toolName string, count int) string {
 		"Please check the request or adjust the tool arguments."
 }
 
+// The no-output stop answer is assembled from these fixed parts (only the turn
+// count varies). IsNoProgressStop matches all three so a legitimate message that
+// merely quotes the marker substring is not misclassified as a failed empty run.
+const (
+	noOutputStopPrefix = "Agent stopped after "
+	noOutputStopMarker = "with no output (no visible text and no tool calls)"
+	noOutputStopSuffix = "to avoid consuming tokens without making progress."
+)
+
 // noOutputStopAnswer is the final answer returned when the no-output guard
 // stops the run. The turn count is interpolated at the call site.
 func noOutputStopAnswer(turns int) string {
-	return "Agent stopped after " + strconv.Itoa(turns) +
-		" turns with no output (no visible text and no tool calls) to avoid consuming tokens without making progress."
+	return noOutputStopPrefix + strconv.Itoa(turns) + " turns " + noOutputStopMarker + " " + noOutputStopSuffix
+}
+
+// IsNoProgressStop reports whether content IS the no-output guardrail stop answer
+// (a run that produced no visible text and no tool calls). It matches the EXACT
+// structure noOutputStopAnswer emits — prefix + "<int> turns " + marker + " " +
+// suffix, where only the integer turn count varies — rather than just looking for
+// the three parts in order. A loose check (prefix && contains-marker && suffix)
+// would misclassify a genuine assistant/tool message that merely quotes the
+// marker amid other prose, which would wrongly hide a real session from /resume
+// and skip its title generation.
+func IsNoProgressStop(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, noOutputStopPrefix) {
+		return false
+	}
+	rest := trimmed[len(noOutputStopPrefix):]
+	const turnsSep = " turns "
+	sep := strings.Index(rest, turnsSep)
+	if sep < 0 {
+		return false
+	}
+	// The text between the prefix and " turns " must be exactly the bare integer
+	// count; anything else means this isn't the guard's own answer.
+	if _, err := strconv.Atoi(rest[:sep]); err != nil {
+		return false
+	}
+	// The marker must be immediately followed (one space) by the suffix and then
+	// end — no arbitrary text wedged in between.
+	return rest[sep+len(turnsSep):] == noOutputStopMarker+" "+noOutputStopSuffix
 }
 
 // Reminder markers are stable substrings used both to build the reminder text

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Gitlawb/zero/internal/agent"
 	"github.com/Gitlawb/zero/internal/sandbox"
@@ -119,14 +120,14 @@ func tuiSessionTitle(prompt string) string {
 func (m model) handleResumeCommand(args string) (model, string) {
 	args = strings.TrimSpace(args)
 	if args == "" {
-		return m, m.resumeText("")
+		return m, m.resumeText()
 	}
 
 	session, err := m.resolveResumeSession(args)
 	if err != nil {
 		return m, "Sessions\n" + err.Error()
 	}
-	events, err := m.sessionStore.ReadEvents(session.SessionID)
+	events, err := m.resumeEvents(session.SessionID)
 	if err != nil {
 		return m, "Sessions\nerror: " + err.Error()
 	}
@@ -141,7 +142,7 @@ func (m model) handleResumeCommand(args string) (model, string) {
 	}
 
 	rows := initialTranscript()
-	rows = appendRow(rows, rowSystem, formatResumeSummary(*session, len(events)))
+	rows = appendRow(rows, rowSystem, m.formatResumeSummary(*session, len(events)))
 	for _, row := range transcriptRowsFromSessionEvents(events) {
 		rows = appendTranscriptRow(rows, row)
 	}
@@ -188,7 +189,36 @@ func (m model) resolveResumeSession(args string) (*sessions.Metadata, error) {
 	return session, nil
 }
 
-func formatResumeSummary(session sessions.Metadata, eventCount int) string {
+// resumeEvents reads a session's events for resume, preferring the rehydrated
+// (compaction-aware) view so a resumed session honors a prior /compact — matching
+// the CLI's `zero exec --resume` (readExecContextEvents) and the in-TUI /compact
+// reload. Falls back to the raw log if rehydration fails.
+func (m model) resumeEvents(sessionID string) ([]sessions.Event, error) {
+	events, err := m.sessionStore.ReadRehydratedEvents(sessionID)
+	if err == nil {
+		return events, nil
+	}
+	raw, rawErr := m.sessionStore.ReadEvents(sessionID)
+	if rawErr != nil {
+		// Surface the raw-read failure (the actual fallback error), not the earlier
+		// rehydration error, so the caller sees why the fallback itself failed.
+		return nil, rawErr
+	}
+	return raw, nil
+}
+
+// formatResumeSummary reports what the resumed conversation will actually continue
+// with (the active model/provider), noting the session's recorded model/provider
+// when it differs — resume keeps the current model rather than switching.
+func (m model) formatResumeSummary(session sessions.Metadata, eventCount int) string {
+	modelLine := "model: " + displayValue(m.modelName, "none")
+	if recorded := strings.TrimSpace(session.ModelID); recorded != "" && !strings.EqualFold(recorded, m.modelName) {
+		modelLine += "  (recorded: " + recorded + ")"
+	}
+	providerLine := "provider: " + displayValue(m.providerName, "none")
+	if recorded := strings.TrimSpace(session.Provider); recorded != "" && !strings.EqualFold(recorded, m.providerName) {
+		providerLine += "  (recorded: " + recorded + ")"
+	}
 	return renderCommandOutput(commandOutput{
 		Title:  "Resumed Zero session",
 		Status: commandStatusOK,
@@ -197,12 +227,123 @@ func formatResumeSummary(session sessions.Metadata, eventCount int) string {
 			Lines: []string{
 				"id: " + session.SessionID,
 				"title: " + displayValue(session.Title, "untitled"),
-				"model: " + displayValue(session.ModelID, "none"),
-				"provider: " + displayValue(session.Provider, "none"),
+				modelLine,
+				providerLine,
 				fmt.Sprintf("events: %d", eventCount),
 			},
 		}},
 	})
+}
+
+// sessionWhen formats a session's RFC3339 timestamp for the picker: a precise
+// clock time (with seconds) for today so same-minute sessions stay distinct, the
+// month/day and time earlier this year, else the date. Empty on a parse error.
+func sessionWhen(timestamp string, now time.Time) string {
+	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(timestamp))
+	if err != nil {
+		return ""
+	}
+	parsed, now = parsed.Local(), now.Local()
+	switch {
+	case parsed.Year() == now.Year() && parsed.YearDay() == now.YearDay():
+		return parsed.Format("15:04:05")
+	case parsed.Year() == now.Year():
+		return parsed.Format("Jan _2 15:04")
+	default:
+		return parsed.Format("2006-01-02")
+	}
+}
+
+// newSessionPicker builds the interactive /resume picker (mirrors /model & /provider):
+// one row per resumable session — title (Label) + id and relative age (Meta). Returns
+// nil when there are no resumable sessions so the caller falls back to the text path.
+func (m model) newSessionPicker() *commandPicker {
+	if m.sessionStore == nil {
+		return nil
+	}
+	metas, err := m.sessionStore.ListResumable()
+	if err != nil || len(metas) == 0 {
+		return nil
+	}
+	now := m.now()
+	items := make([]pickerItem, 0, len(metas))
+	for _, meta := range metas {
+		// Skip empty/failed runs (no assistant output, no tool calls) — e.g. the
+		// same prompt retried while the model wasn't responding. They have nothing
+		// to resume and otherwise flood the list with identical rows. Still on disk.
+		if !m.sessionHasResumableContent(meta.SessionID) {
+			continue
+		}
+		// Lead with the timestamp so same-titled sessions (e.g. the same first
+		// prompt run several times) are visually distinct; the id (right, faint)
+		// stays for reference and is what selection actually resolves.
+		label := displayValue(meta.Title, "untitled")
+		if when := sessionWhen(meta.UpdatedAt, now); when != "" {
+			label = when + "  " + label
+		}
+		items = append(items, pickerItem{
+			Label: label,
+			Value: meta.SessionID,
+			Meta:  meta.SessionID,
+		})
+	}
+	if len(items) == 0 {
+		return nil // every resumable session was an empty/failed run
+	}
+	return &commandPicker{
+		kind:     pickerSession,
+		title:    "Resume a session",
+		items:    items,
+		allItems: append([]pickerItem{}, items...),
+		selected: 0,
+	}
+}
+
+// sessionHasResumableContent reports whether a session has anything worth
+// resuming: a tool call/result, or a non-user message with real content (not the
+// no-output guardrail stop). Empty/failed runs return false and are hidden from
+// the picker (they stay on disk). Errors fail open (the session is kept).
+func (m model) sessionHasResumableContent(sessionID string) bool {
+	events, err := m.sessionStore.ReadEvents(sessionID)
+	if err != nil {
+		return true
+	}
+	return eventsHaveResumableContent(events)
+}
+
+// eventsHaveResumableContent reports whether already-loaded events contain
+// anything worth resuming: a tool call/result, or a non-user message with real
+// content (not the no-output guardrail stop). It is the pure core of
+// sessionHasResumableContent so callers that already hold the events (e.g. the
+// /retitle scan) don't re-read them.
+func eventsHaveResumableContent(events []sessions.Event) bool {
+	for _, event := range events {
+		switch event.Type {
+		case sessions.EventToolCall, sessions.EventToolResult:
+			return true
+		case sessions.EventMessage:
+			payload := sessionPayload(event)
+			if strings.EqualFold(payloadString(payload, "role"), "user") {
+				continue
+			}
+			content := strings.TrimSpace(payloadString(payload, "content"))
+			if content != "" && !agent.IsNoProgressStop(content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// openSessionPicker opens the /resume picker; ok is false when there is nothing to
+// resume (the caller then falls back to the text list / "none" message).
+func (m model) openSessionPicker() (model, bool) {
+	picker := m.newSessionPicker()
+	if picker == nil {
+		return m, false
+	}
+	m.picker = picker
+	return m, true
 }
 
 func transcriptRowsFromSessionEvents(events []sessions.Event) []transcriptRow {

@@ -65,36 +65,48 @@ type model struct {
 	doctorFrame            int
 	activeSession          sessions.Metadata
 	sessionEvents          []sessions.Event
-	usageTracker           *usage.Tracker
-	sessionCompactor       SessionCompactor
-	prService              *PrService
-	prState                PrState
-	prWatcherStop          func()
-	runtimeMessageSink     func(tea.Msg)
-	agentOptions           agent.Options
-	notifier               *notify.Notifier
-	permissionMode         agent.PermissionMode
-	selfCorrectTests       bool
-	reasoningEffort        modelregistry.ReasoningEffort
-	responseStyle          string
-	userAgent              string
-	compactRequests        int
-	compactInFlight        bool
-	compactFrame           int
-	lastCompactResult      *CompactResult
-	lastCompactError       string
-	unpricedRequests       int
-	unpricedTokens         int
-	transcript             []transcriptRow
-	transcriptDetailed     bool
-	transcriptBodyHeights  *transcriptBodyHeightCache
-	input                  textinput.Model
-	composer               composerState
-	composerActive         bool
-	composerPastePreviews  []composerPastePreview
-	altScreen              bool
-	setup                  setupState
-	setupSave              func(SetupSelection) (SetupResult, error)
+	// titledSessions records session ids for which a model-generated title has
+	// already been attempted this process, so a finished turn re-fires the title
+	// generator at most once per session (even before its async result lands).
+	// Lazily initialized.
+	titledSessions map[string]bool
+	// retitle* drive the sequential /retitle backfill: queued session ids still
+	// awaiting a title, whether a backfill is running, and its progress counters.
+	retitleQueue          []string
+	retitleActive         bool
+	retitleTotal          int
+	retitleDone           int
+	retitleOK             int
+	usageTracker          *usage.Tracker
+	sessionCompactor      SessionCompactor
+	prService             *PrService
+	prState               PrState
+	prWatcherStop         func()
+	runtimeMessageSink    func(tea.Msg)
+	agentOptions          agent.Options
+	notifier              *notify.Notifier
+	permissionMode        agent.PermissionMode
+	selfCorrectTests      bool
+	reasoningEffort       modelregistry.ReasoningEffort
+	responseStyle         string
+	userAgent             string
+	compactRequests       int
+	compactInFlight       bool
+	compactFrame          int
+	lastCompactResult     *CompactResult
+	lastCompactError      string
+	unpricedRequests      int
+	unpricedTokens        int
+	transcript            []transcriptRow
+	transcriptDetailed    bool
+	transcriptBodyHeights *transcriptBodyHeightCache
+	input                 textinput.Model
+	composer              composerState
+	composerActive        bool
+	composerPastePreviews []composerPastePreview
+	altScreen             bool
+	setup                 setupState
+	setupSave             func(SetupSelection) (SetupResult, error)
 	// spinner animates the running-tool glyph in card heads. Its tick is started
 	// with each run and stops itself once pending clears (the TickMsg is simply
 	// not forwarded), so an idle UI schedules no timers.
@@ -1151,7 +1163,17 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.notifier != nil {
 			m.notifier.Notify(notify.Completion, notify.DefaultMessage(notify.Completion))
 		}
-		return m.launchQueuedMessageIfReady()
+		// A successful turn gives the session real content; if it still carries its
+		// default first-message title, generate a concise one in the background
+		// (one-shot per session). A failed turn is skipped — there's nothing to name.
+		var titleCmd tea.Cmd
+		if msg.err == nil {
+			m, titleCmd = m.maybeAutoTitleActiveSession()
+		}
+		next, queuedCmd := m.launchQueuedMessageIfReady()
+		return next, tea.Batch(titleCmd, queuedCmd)
+	case sessionTitleGeneratedMsg:
+		return m.handleSessionTitleGenerated(msg)
 	case compactResultMsg:
 		if !m.compactInFlight {
 			return m, nil
@@ -2156,6 +2178,14 @@ func (m model) choosePicker() (tea.Model, tea.Cmd) {
 		text := ""
 		m, text = m.handleModeCommand(item.Value)
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: text})
+	case pickerSession:
+		// item.Value is the chosen session id; handleResumeCommand hydrates it and
+		// rebuilds the transcript (returning "" on success, an error note on failure).
+		text := ""
+		m, text = m.handleResumeCommand(item.Value)
+		if text != "" {
+			m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: text})
+		}
 	}
 	return m, nil
 }
@@ -2313,6 +2343,14 @@ func (m model) handleSubmit() (tea.Model, tea.Cmd) {
 			})
 			return m, nil
 		}
+		// Bare `/resume` opens an interactive session picker (like /model & /provider);
+		// `/resume <id>` and `/resume latest` still resolve directly. The picker falls
+		// back to the text path when there is nothing to resume.
+		if strings.TrimSpace(command.text) == "" {
+			if next, ok := m.openSessionPicker(); ok {
+				return next, nil
+			}
+		}
 		text := ""
 		m, text = m.handleResumeCommand(command.text)
 		if strings.HasPrefix(text, sessionsCardsPrefix) {
@@ -2326,6 +2364,21 @@ func (m model) handleSubmit() (tea.Model, tea.Cmd) {
 			m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: text})
 		}
 		return m, nil
+	case commandRetitle:
+		if m.pending {
+			m.transcript = reduceTranscript(m.transcript, transcriptAction{
+				kind: actionAppendError,
+				text: "Cannot retitle sessions while a run is active.",
+			})
+			return m, nil
+		}
+		text := ""
+		var retitleCmd tea.Cmd
+		m, retitleCmd, text = m.startSessionRetitle()
+		if text != "" {
+			m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: text})
+		}
+		return m, retitleCmd
 	case commandSpec:
 		return m.handleSpecCommand(command.text)
 	case commandCompact:

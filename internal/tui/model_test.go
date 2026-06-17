@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -873,15 +874,170 @@ func TestResumeCommandListsRecentSessions(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("expected /resume to be handled without starting an agent run")
 	}
-	if !transcriptContains(next.transcript, "Newer") || !transcriptContains(next.transcript, "Older") {
-		t.Fatalf("expected session list in transcript, got %#v", next.transcript)
+	// Bare /resume now opens the interactive session picker (like /model & /provider).
+	if next.picker == nil || next.picker.kind != pickerSession {
+		t.Fatalf("expected /resume to open the session picker, got picker=%#v", next.picker)
 	}
-	// The list renders as stacked cards: id + age + title + meta per session.
-	view := viewString(next.View())
-	for _, want := range []string{first.SessionID, second.SessionID, "1 events", "anthropic"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("sessions card view missing %q:\n%s", want, view)
+	// Every row carries the session title (in the Label, after the timestamp) and
+	// resolves to / shows the session id (Value + Meta), for both sessions.
+	findByID := func(id string) (pickerItem, bool) {
+		for _, item := range next.picker.items {
+			if item.Value == id {
+				return item, true
+			}
 		}
+		return pickerItem{}, false
+	}
+	for _, want := range []struct{ title, id string }{{"Newer", second.SessionID}, {"Older", first.SessionID}} {
+		item, ok := findByID(want.id)
+		if !ok {
+			t.Fatalf("picker missing session id %q; items=%#v", want.id, next.picker.items)
+		}
+		if !strings.Contains(item.Label, want.title) {
+			t.Fatalf("picker Label %q should contain the title %q", item.Label, want.title)
+		}
+		if !strings.Contains(item.Meta, want.id) {
+			t.Fatalf("picker %q Meta should show the id %q, got %q", want.title, want.id, item.Meta)
+		}
+	}
+	// The picker overlay renders the titles and ids.
+	view := viewString(next.View())
+	for _, want := range []string{"Resume a session", "Newer", "Older", first.SessionID, second.SessionID} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("session picker view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestResumePickerSelectionHydratesSession(t *testing.T) {
+	store := testSessionStore(t)
+	target, err := store.Create(sessions.CreateInput{Title: "Pick me", ModelID: "gpt-4.1", Provider: "openai"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	if _, err := store.AppendEvent(target.SessionID, sessions.AppendEventInput{Type: sessions.EventMessage, Payload: map[string]any{"content": "hello"}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := store.Create(sessions.CreateInput{Title: "Other", ModelID: "x", Provider: "y"}); err != nil {
+		t.Fatalf("Create other: %v", err)
+	}
+
+	m := newModel(context.Background(), Options{SessionStore: store})
+	m.input.SetValue("/resume")
+	updated, _ := m.Update(testKey(tea.KeyEnter))
+	m = updated.(model)
+	if m.picker == nil || m.picker.kind != pickerSession {
+		t.Fatalf("expected the session picker to open, got %#v", m.picker)
+	}
+	for i, item := range m.picker.items {
+		if item.Value == target.SessionID {
+			m.picker.selected = i
+		}
+	}
+
+	updated, cmd := m.Update(testKey(tea.KeyEnter)) // choosePicker
+	next := updated.(model)
+	if cmd != nil {
+		t.Fatal("selecting a session to resume should not start an agent run")
+	}
+	if next.picker != nil {
+		t.Fatal("picker should close after a selection")
+	}
+	if next.activeSession.SessionID != target.SessionID {
+		t.Fatalf("active session = %q, want %q", next.activeSession.SessionID, target.SessionID)
+	}
+	if !transcriptContains(next.transcript, "Resumed Zero session") || !transcriptContains(next.transcript, target.SessionID) {
+		t.Fatalf("expected the resume summary in the transcript, got %#v", next.transcript)
+	}
+}
+
+func TestResumePickerHidesEmptyFailedSessions(t *testing.T) {
+	store := testSessionStore(t)
+	real, err := store.Create(sessions.CreateInput{Title: "Real one", ModelID: "gpt-4.1", Provider: "openai"})
+	if err != nil {
+		t.Fatalf("Create real: %v", err)
+	}
+	if _, err := store.AppendEvent(real.SessionID, sessions.AppendEventInput{Type: sessions.EventMessage, Payload: map[string]any{"role": "user", "content": "do a thing"}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := store.AppendEvent(real.SessionID, sessions.AppendEventInput{Type: sessions.EventMessage, Payload: map[string]any{"role": "assistant", "content": "here is the thing"}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	// An empty/failed run: prompt + the no-output guardrail stop, nothing else.
+	empty, err := store.Create(sessions.CreateInput{Title: "Empty one", ModelID: "gpt-4.1", Provider: "openai"})
+	if err != nil {
+		t.Fatalf("Create empty: %v", err)
+	}
+	if _, err := store.AppendEvent(empty.SessionID, sessions.AppendEventInput{Type: sessions.EventMessage, Payload: map[string]any{"role": "user", "content": "do a thing"}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := store.AppendEvent(empty.SessionID, sessions.AppendEventInput{Type: sessions.EventMessage, Payload: map[string]any{"role": "assistant", "content": "Agent stopped after 3 turns with no output (no visible text and no tool calls) to avoid consuming tokens without making progress."}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	picker := newModel(context.Background(), Options{SessionStore: store}).newSessionPicker()
+	if picker == nil {
+		t.Fatal("expected a picker containing the real session")
+	}
+	for _, item := range picker.items {
+		if item.Value == empty.SessionID {
+			t.Fatalf("empty/no-output session must be hidden from the picker: %#v", picker.items)
+		}
+	}
+	shown := false
+	for _, item := range picker.items {
+		if item.Value == real.SessionID {
+			shown = true
+		}
+	}
+	if !shown {
+		t.Fatalf("the real session must be shown: %#v", picker.items)
+	}
+}
+
+func TestResumeHonorsPriorCompaction(t *testing.T) {
+	store := testSessionStore(t)
+	session, err := store.Create(sessions.CreateInput{Title: "Compacted", ModelID: "gpt-4.1", Provider: "openai"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, content := range []string{"alpha", "beta", "gamma", "delta"} {
+		if _, err := store.AppendEvent(session.SessionID, sessions.AppendEventInput{Type: sessions.EventMessage, Payload: map[string]string{"content": content}}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	plan, err := store.PlanCompaction(session.SessionID, sessions.CompactionOptions{PreserveLast: 2, MaxPromptChars: 500})
+	if err != nil {
+		t.Fatalf("PlanCompaction: %v", err)
+	}
+	if _, err := store.RecordCompaction(session.SessionID, sessions.RecordCompactionInput{Plan: plan, Summary: "early summary"}); err != nil {
+		t.Fatalf("RecordCompaction: %v", err)
+	}
+	if _, err := store.AppendEvent(session.SessionID, sessions.AppendEventInput{Type: sessions.EventMessage, Payload: map[string]string{"content": "epsilon"}}); err != nil {
+		t.Fatalf("Append epsilon: %v", err)
+	}
+
+	raw, err := store.ReadEvents(session.SessionID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	rehydrated, err := store.ReadRehydratedEvents(session.SessionID)
+	if err != nil {
+		t.Fatalf("ReadRehydratedEvents: %v", err)
+	}
+	if len(rehydrated) >= len(raw) {
+		t.Fatalf("test setup invalid: rehydrated (%d) should be < raw (%d)", len(rehydrated), len(raw))
+	}
+
+	m := newModel(context.Background(), Options{SessionStore: store})
+	next, _ := m.handleResumeCommand(session.SessionID)
+	// Resume must load the rehydrated (compaction-aware) context, not the raw log —
+	// matching the CLI's --resume and the in-TUI /compact reload. Compare contents,
+	// not just length: a regression that returned a same-length but reordered or
+	// substituted slice (e.g. a dropped original in place of the summary) would
+	// slip past a length check.
+	if !reflect.DeepEqual(next.sessionEvents, rehydrated) {
+		t.Fatalf("resumed sessionEvents do not match the rehydrated context (resume must honor prior compaction)\nresumed:    %+v\nrehydrated: %+v\nraw:        %+v", next.sessionEvents, rehydrated, raw)
 	}
 }
 
