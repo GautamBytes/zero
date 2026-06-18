@@ -205,8 +205,12 @@ type model struct {
 	// rather than "/command" matches, so completion inserts a path token instead
 	// of replacing the whole input.
 	suggestionsAreFiles bool
-	lastMouseSelection  mouseSelectionTarget
-	mouseCapture        bool
+	// suggestionsAreSpecialists is true when the overlay is showing leading
+	// "@specialist" matches; completion inserts "@name " and the submit path
+	// expands the mention into a Task-delegation directive (launchPrompt).
+	suggestionsAreSpecialists bool
+	lastMouseSelection        mouseSelectionTarget
+	mouseCapture              bool
 	// mouseReleased, when true, forces terminal mouse capture OFF so the user can
 	// drag-select and copy text natively (Ctrl+E toggles it). App mouse features
 	// (clickable suggestions, right-click paste, transcript select) pause while on.
@@ -2632,6 +2636,12 @@ func (m model) launchPrompt(prompt string) (model, tea.Cmd) {
 			text: "No provider configured.",
 		})
 		return m, nil
+	}
+	// A leading "@specialist <task>" is expanded into an explicit Task-delegation
+	// directive for the agent only; the transcript above keeps the user's verbatim
+	// "@mention". Non-mentions and mid-message "@file" references are unchanged.
+	if expanded, ok := expandSpecialistMention(prompt, m.agentOptions.Specialists); ok {
+		prompt = expanded
 	}
 	// Prepend any staged PDF document text as a model-facing preamble. The
 	// visible transcript above keeps the user's clean prompt; the agent (and the

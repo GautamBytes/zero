@@ -58,10 +58,10 @@ type BuildArgsInput struct {
 	CurrentDepth          int
 	Description           string
 	Cwd                   string
-	// PermissionMode is the parent's resolved permission mode. Empty preserves
-	// the historical "--auto high" (the Task tool omits it); a caller that
-	// passes a non-unsafe mode (e.g. the swarm propagating a non-unsafe
-	// orchestrator) gets a non-unsafe child so authority is never widened.
+	// PermissionMode is the parent's resolved permission mode. Only an explicit
+	// unsafe mode runs the child at "--auto high"; empty or any other value is
+	// fail-safe "low", so a caller that forgets to wire it never escalates the
+	// child to unsafe. Authority is therefore never widened beyond the parent.
 	PermissionMode string
 }
 
@@ -87,6 +87,12 @@ type TaskParameters struct {
 	Description     string
 	RunInBackground bool
 	Resume          string
+	// Manifest, when non-nil, supplies the specialist definition inline instead
+	// of resolving Name against the specialist registry. It is validated before
+	// use. The swarm launcher sets this so a swarm member can run from its own
+	// agent definition (e.g. "subagent"/"teammate"), which is not a registered
+	// specialist and would otherwise fail the name lookup.
+	Manifest *Manifest
 }
 
 type TaskRunOptions struct {
@@ -97,23 +103,25 @@ type TaskRunOptions struct {
 	CurrentDepth          int
 	Cwd                   string
 	// PermissionMode propagates the parent's resolved permission mode to the
-	// child. Empty keeps the historical "--auto high"; a non-unsafe value runs
-	// the child non-unsafe so it never gains more authority than the parent.
+	// child. Only an explicit unsafe mode runs the child unsafe; empty or any
+	// other value is fail-safe "low", so the child never gains more authority
+	// than the parent.
 	PermissionMode string
 }
 
 // specialistAutonomy maps a parent permission mode to the child's "--auto"
 // level. A headless specialist child cannot answer interactive prompts, so it
-// runs autonomously — but only at "high" (unsafe) when the parent is itself
-// unsafe (or when no mode is provided, preserving the Task tool's behavior).
-// Any other parent mode yields the non-unsafe "low" level, so the child's
-// authority never exceeds the parent's.
+// runs autonomously — but only at "high" (unsafe) when the parent is EXPLICITLY
+// unsafe. An empty or unrecognized mode is fail-safe "low": an orchestrator that
+// forgets to wire PermissionMode never silently escalates the child to unsafe.
+// (Both the Task tool and the swarm propagate a resolved mode, so "" only occurs
+// for a caller that omitted it.) The child's authority never exceeds the parent's.
 func specialistAutonomy(permissionMode string) string {
 	switch strings.TrimSpace(permissionMode) {
-	case "", string(permissionModeUnsafe):
+	case string(permissionModeUnsafe):
 		return "high"
 	default:
-		return "low"
+		return "low" // unset/unknown modes do NOT inherit unsafe autonomy
 	}
 }
 
@@ -121,6 +129,41 @@ func specialistAutonomy(permissionMode string) string {
 // agent package (which would create an import cycle): exec resolves "--auto high"
 // to this mode.
 const permissionModeUnsafe = "unsafe"
+
+// readOnlySpecialistTools are the tools a "safe" specialist may hold — pure reads
+// plus planning. A specialist whose resolved tools are ALL in this set cannot
+// modify the workspace or run commands, so spawning it is harmless and the Task
+// tool auto-approves it (no permission prompt).
+var readOnlySpecialistTools = map[string]bool{
+	"read_file":      true,
+	"list_directory": true,
+	"grep":           true,
+	"glob":           true,
+	"update_plan":    true,
+}
+
+// IsReadOnlySpecialist reports whether the named specialist resolves to a
+// read-only tool set. Unknown names and load errors return false, so a caller
+// (the Task tool's permission gate) stays on the safe prompt path when in doubt.
+func (executor Executor) IsReadOnlySpecialist(name string) bool {
+	manifest, err := executor.loadManifest(name)
+	if err != nil {
+		return false
+	}
+	return manifestIsReadOnly(manifest)
+}
+
+func manifestIsReadOnly(manifest Manifest) bool {
+	if len(manifest.ResolvedTools) == 0 {
+		return false
+	}
+	for _, tool := range manifest.ResolvedTools {
+		if !readOnlySpecialistTools[tool] {
+			return false
+		}
+	}
+	return true
+}
 
 type ExecResult struct {
 	Result    tools.Result
@@ -246,7 +289,7 @@ func (executor Executor) BuildResumeArgs(input BuildResumeArgsInput) (BuildArgsR
 }
 
 func (executor Executor) runFresh(ctx context.Context, params TaskParameters, options TaskRunOptions) (ExecResult, error) {
-	manifest, err := executor.loadManifest(params.Name)
+	manifest, err := executor.freshManifest(params)
 	if err != nil {
 		return ExecResult{}, err
 	}
@@ -269,6 +312,21 @@ func (executor Executor) runFresh(ctx context.Context, params TaskParameters, op
 		return executor.runBackground(ctx, built, manifest, params, options)
 	}
 	return executor.runBuiltArgs(ctx, built, manifest, params, options, "foreground")
+}
+
+// freshManifest resolves the manifest for a fresh run. A caller-supplied inline
+// manifest (validated here) takes precedence over a registry lookup by name, so a
+// caller with its own definition — the swarm launcher running a member whose
+// agent type is not a registered specialist — can run without a registry entry.
+func (executor Executor) freshManifest(params TaskParameters) (Manifest, error) {
+	if params.Manifest != nil {
+		manifest := *params.Manifest
+		if err := Validate(&manifest); err != nil {
+			return Manifest{}, fmt.Errorf("inline specialist manifest: %w", err)
+		}
+		return manifest, nil
+	}
+	return executor.loadManifest(params.Name)
 }
 
 func (executor Executor) runResume(ctx context.Context, params TaskParameters, options TaskRunOptions) (ExecResult, error) {
