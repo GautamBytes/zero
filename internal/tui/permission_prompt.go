@@ -23,8 +23,6 @@ func permissionOptions(request agent.PermissionRequest) []permissionOption {
 	if len(decisions) == 0 {
 		decisions = []agent.PermissionDecisionAction{
 			agent.PermissionDecisionAllow,
-			agent.PermissionDecisionAllowForSession,
-			agent.PermissionDecisionAlwaysAllow,
 			agent.PermissionDecisionDeny,
 		}
 	}
@@ -44,6 +42,8 @@ func permissionOptions(request agent.PermissionRequest) []permissionOption {
 			options = append(options, permissionOption{label: "always", hotkey: "y", choice: permissionDecisionAlwaysAllow})
 		case agent.PermissionDecisionDeny:
 			options = append(options, permissionOption{label: "deny", hotkey: "d", choice: permissionDecisionDeny})
+		case agent.PermissionDecisionCancel:
+			options = append(options, permissionOption{label: "cancel", hotkey: "n", choice: permissionDecisionCancel})
 		}
 	}
 	if len(options) == 0 {
