@@ -758,7 +758,19 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return transcriptCopyStatusExpiredMsg{seq: seq}
 			})
 		}
+		if msg.content == "" {
+			// Empty text clipboard — may be a screenshot. Probe for image.
+			return m, readClipboardImageCmd()
+		}
 		return m.routePaste(msg.content)
+	case clipboardImageMsg:
+		if msg.err != nil {
+			return m.appendImageNotice("Clipboard image read failed: " + msg.err.Error()), nil
+		}
+		if msg.data == nil {
+			return m, nil // no image — silent no-op
+		}
+		return m.attachClipboardImage(msg.data, msg.mediaType), nil
 	case tea.PasteMsg:
 		return m.routePaste(msg.Content)
 	case tea.KeyPressMsg:
@@ -3022,7 +3034,7 @@ func (m model) launchPrompt(prompt string) (model, tea.Cmd) {
 	// exec's drop+warn wording) rather than sending them to a model that
 	// rejects them. Pending state is cleared either way below.
 	turnImages := m.pendingImages
-	if len(turnImages) > 0 && !modelSupportsVisionTUI(m.modelName) {
+	if len(turnImages) > 0 && !m.modelSupportsVisionTUI() {
 		name := m.modelName
 		if name == "" {
 			name = "the active model"
