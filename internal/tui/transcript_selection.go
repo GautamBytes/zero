@@ -181,7 +181,7 @@ func (m model) transcriptBodyItems(width int, emptyOverlay string) []transcriptB
 						specialists = append(specialists, *r.specialistInfo)
 					}
 				}
-				summary := renderSpecialistSummary(specialists, m.spinner.View())
+				summary := renderSpecialistSummary(specialists, m.spinnerGlyph())
 				if summary != "" {
 					items = append(items, transcriptBlockBodyItem(transcriptBodyItemRow, -1, summary))
 					items = append(items, transcriptBlankBodyItem())
@@ -498,7 +498,8 @@ func (m model) renderSelectableUserRow(rowIndex int, row transcriptRow, width in
 
 func (m model) renderSelectableAssistantRow(rowIndex int, row transcriptRow, width int, startBodyY int) (string, []transcriptSelectableLine) {
 	tableMeasure := width
-	wrapped := renderAssistantMarkdownText(row.text, assistantMeasure(width), tableMeasure)
+	// Committed/selectable row: highlight (the result is cached per row).
+	wrapped := renderAssistantMarkdownText(row.text, assistantMeasure(width), tableMeasure, true)
 	selectable := make([]transcriptSelectableLine, 0, len(wrapped))
 	for index, line := range wrapped {
 		plainLine := stripMarkdownRenderControls(line)
