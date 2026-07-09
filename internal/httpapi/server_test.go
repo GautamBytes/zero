@@ -15,6 +15,7 @@ import (
 
 	"github.com/Gitlawb/zero/internal/agent"
 	"github.com/Gitlawb/zero/internal/sessions"
+	"github.com/Gitlawb/zero/internal/streamjson"
 )
 
 func TestAuthCORSAndOpenAPI(t *testing.T) {
@@ -99,6 +100,15 @@ func TestAuthFailsClosedWhenTokenMissing(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "auth_misconfigured") {
 		t.Fatalf("expected auth_misconfigured, got %s", recorder.Body.String())
+	}
+}
+
+func TestLoopbackHostRejectsEmptyHost(t *testing.T) {
+	if LoopbackHost("") {
+		t.Fatal("empty host must not be treated as loopback")
+	}
+	if !LoopbackHost("localhost") || !LoopbackHost("127.0.0.1") || !LoopbackHost("::1") {
+		t.Fatal("explicit loopback hosts should be allowed")
 	}
 }
 
@@ -203,6 +213,73 @@ func TestDuplicateRunReturnsConflict(t *testing.T) {
 		t.Fatalf("duplicate status = %d; body=%s", recorder.Code, recorder.Body.String())
 	}
 	close(release)
+}
+
+func TestEventBrokerDisconnectsSlowSubscriberOnBlockingControlEvent(t *testing.T) {
+	previousTimeout := controlEventSendTimeout
+	controlEventSendTimeout = 10 * time.Millisecond
+	defer func() {
+		controlEventSendTimeout = previousTimeout
+	}()
+
+	broker := newEventBroker()
+	ch, unsubscribe := broker.subscribe("")
+	defer unsubscribe()
+	for index := 0; index < cap(ch); index++ {
+		broker.publish(streamjson.Event{Type: streamjson.EventText})
+	}
+	broker.publish(streamjson.Event{Type: streamjson.EventPermissionRequest})
+
+	broker.mu.Lock()
+	_, stillSubscribed := broker.subscribers[ch]
+	broker.mu.Unlock()
+	if stillSubscribed {
+		t.Fatal("slow subscriber stayed registered after blocking control event timed out")
+	}
+}
+
+func TestAsyncRunPanicPublishesTerminalEvents(t *testing.T) {
+	store := sessions.NewStore(sessions.StoreOptions{RootDir: t.TempDir()})
+	if _, err := store.Create(sessions.CreateInput{SessionID: "s1", Title: "One"}); err != nil {
+		t.Fatal(err)
+	}
+	server := New(Options{
+		Cwd:    t.TempDir(),
+		NoAuth: true,
+		Store:  store,
+		Runner: RunnerFunc(func(ctx context.Context, request RunRequest, hooks RunHooks) (RunResult, error) {
+			panic("boom")
+		}),
+	})
+	events, unsubscribe := server.events.subscribe("s1")
+	defer unsubscribe()
+
+	recorder := serveJSON(t, server, http.MethodPost, "/session/s1/prompt_async", `{"content":"go"}`)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("async status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	seenError := false
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event.Type == streamjson.EventError && event.Code == "run_panic" {
+				seenError = true
+			}
+			if event.Type == streamjson.EventRunEnd {
+				if !seenError {
+					t.Fatal("run_end arrived before run_panic error")
+				}
+				if event.Status != "error" {
+					t.Fatalf("run_end status = %q, want error", event.Status)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("panic terminal events were not published")
+		}
+	}
 }
 
 func TestPermissionAndAskBrokersBlockUntilHTTPAnswer(t *testing.T) {

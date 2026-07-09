@@ -317,11 +317,13 @@ func (server *Server) handlePrompt(w http.ResponseWriter, r *http.Request, sessi
 		return
 	}
 	if async {
-		go server.executeRun(ctx, cancel, request)
+		go func() {
+			_, _ = server.executeRunSafely(ctx, cancel, request)
+		}()
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	result, err := server.executeRun(ctx, cancel, request)
+	result, err := server.executeRunSafely(ctx, cancel, request)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			writeError(w, 499, "cancelled", "run cancelled")
@@ -331,6 +333,17 @@ func (server *Server) handlePrompt(w http.ResponseWriter, r *http.Request, sessi
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (server *Server) executeRunSafely(ctx context.Context, cancel context.CancelFunc, request RunRequest) (result RunResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("run panicked: %v", recovered)
+			server.publishRunError(request, "run_panic", err.Error(), 1)
+			result = RunResult{RunID: request.RunID, SessionID: request.SessionID, Status: "error", ExitCode: 1}
+		}
+	}()
+	return server.executeRun(ctx, cancel, request)
 }
 
 func (server *Server) startRunWithParent(parent context.Context, sessionID string, runID string) (context.Context, context.CancelFunc, bool) {

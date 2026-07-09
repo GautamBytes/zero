@@ -65,6 +65,33 @@ test('event.subscribe yields parsed SSE events', async () => {
   assert.deepEqual(events, [{ type: 'text', delta: 'hi' }])
 })
 
+test('event.subscribe handles SSE chunks split across line boundaries', async () => {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(': ping\n\n'))
+      controller.enqueue(encoder.encode('event: text\n'))
+      controller.enqueue(encoder.encode('data: {"type":"text",'))
+      controller.enqueue(encoder.encode('"delta":"hi"}\n\n'))
+      controller.close()
+    },
+  })
+  const client = createZeroClient({
+    baseUrl: 'http://zero.local',
+    fetch: async (url) => {
+      assert.equal(String(url), 'http://zero.local/event?sessionId=s1')
+      return new Response(stream, { headers: { 'content-type': 'text/event-stream' } })
+    },
+  })
+
+  const events = []
+  for await (const event of client.event.subscribe({ sessionId: 's1' })) {
+    events.push(event)
+  }
+
+  assert.deepEqual(events, [{ type: 'text', delta: 'hi' }])
+})
+
 test('promptAsync returns undefined on 204', async () => {
   const client = createZeroClient({
     baseUrl: 'http://zero.local',

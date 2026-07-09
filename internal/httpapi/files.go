@@ -117,7 +117,6 @@ func (server *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return nil
 		}
-		defer file.Close()
 		rel, _ := filepath.Rel(server.options.Cwd, path)
 		scanner := bufio.NewScanner(file)
 		lineNo := 0
@@ -135,6 +134,7 @@ func (server *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		_ = file.Close()
 		return nil
 	})
 	if err != nil {

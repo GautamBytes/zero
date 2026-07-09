@@ -62,7 +62,10 @@ func (server *Server) corsAllowed(origin string) bool {
 
 func LoopbackHost(hostname string) bool {
 	host := strings.TrimSpace(hostname)
-	if host == "" || strings.EqualFold(host, "localhost") {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)

@@ -54,7 +54,11 @@ func runServeHTTP(options serveOptions, stdout io.Writer, stderr io.Writer, deps
 	if err != nil {
 		return writeAppError(stderr, "failed to listen: "+err.Error(), exitCrash)
 	}
-	server := &http.Server{Handler: api}
+	server := &http.Server{
+		Handler:           api,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	runCtx, stopSignals := signalContext()
 	defer stopSignals()
 	go func() {

@@ -20,6 +20,8 @@ type eventBroker struct {
 	subscribers map[chan streamjson.Event]string
 }
 
+var controlEventSendTimeout = 5 * time.Second
+
 func newEventBroker() *eventBroker {
 	return &eventBroker{subscribers: map[chan streamjson.Event]string{}}
 }
@@ -31,8 +33,10 @@ func (broker *eventBroker) subscribe(sessionID string) (chan streamjson.Event, f
 	broker.mu.Unlock()
 	return ch, func() {
 		broker.mu.Lock()
-		delete(broker.subscribers, ch)
-		close(ch)
+		if _, ok := broker.subscribers[ch]; ok {
+			delete(broker.subscribers, ch)
+			close(ch)
+		}
 		broker.mu.Unlock()
 	}
 }
@@ -44,11 +48,31 @@ func (broker *eventBroker) publish(event streamjson.Event) {
 		if sessionID != "" && event.SessionID != "" && sessionID != event.SessionID {
 			continue
 		}
+		if isBlockingControlEvent(event) {
+			timer := time.NewTimer(controlEventSendTimeout)
+			select {
+			case ch <- event:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			case <-timer.C:
+				delete(broker.subscribers, ch)
+				close(ch)
+			}
+			continue
+		}
 		select {
 		case ch <- event:
 		default:
 		}
 	}
+}
+
+func isBlockingControlEvent(event streamjson.Event) bool {
+	return event.Type == streamjson.EventPermissionRequest || event.Type == streamjson.EventType("ask_user_request")
 }
 
 type permissionBroker struct {
@@ -258,7 +282,10 @@ func serveSSE(w http.ResponseWriter, r *http.Request, broker *eventBroker) {
 		select {
 		case <-r.Context().Done():
 			return
-		case event := <-ch:
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
 			writeSSEEvent(w, event)
 			flusher.Flush()
 		case <-heartbeat.C:
