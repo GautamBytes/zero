@@ -115,6 +115,7 @@ func TestAltScreenTranscriptScrollKeepsFooterFixed(t *testing.T) {
 	m := newModel(context.Background(), Options{AltScreen: true, ProviderName: "openai", ModelName: "gpt-4.1"})
 	m.width = 90
 	m.height = 10
+	m.cwd = "/workspace/zero"
 	m.gitBranch = "feat/pinned-header"
 	for index := 0; index < 14; index++ {
 		m.transcript = appendRow(m.transcript, rowAssistant, "message "+string(rune('A'+index)))

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/Gitlawb/zero/internal/httpapi"
 )
 
 func TestRunServeMCPListsReadOnlyToolsByDefault(t *testing.T) {
@@ -75,8 +77,98 @@ func TestRunServeRequiresMCPMode(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("expected empty stdout, got %q", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "serve requires --mcp") {
+	if !strings.Contains(stderr.String(), "serve requires exactly one of --mcp or --http") {
 		t.Fatalf("expected usage error, got %q", stderr.String())
+	}
+}
+
+func TestParseServeHTTPFlags(t *testing.T) {
+	options, help, err := parseServeArgs([]string{
+		"--http",
+		"--hostname", "localhost",
+		"--port=4100",
+		"--cors", "https://app.example",
+		"--cors=https://admin.example",
+		"--auth-token", "token",
+		"-C", "/tmp/work",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if help {
+		t.Fatal("unexpected help")
+	}
+	if !options.http || options.mcp {
+		t.Fatalf("mode flags = http:%v mcp:%v", options.http, options.mcp)
+	}
+	if options.hostname != "localhost" || options.port != 4100 || options.authToken != "token" || options.cwd != "/tmp/work" {
+		t.Fatalf("unexpected options: %+v", options)
+	}
+	if got := strings.Join(options.cors, ","); got != "https://app.example,https://admin.example" {
+		t.Fatalf("cors = %q", got)
+	}
+}
+
+func TestParseServeRejectsInvalidHTTPPort(t *testing.T) {
+	_, _, err := parseServeArgs([]string{"--http", "--port", "70000"})
+	if err == nil {
+		t.Fatal("expected invalid port error")
+	}
+}
+
+func TestRunServeRejectsMixedServeFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "mcp with http flag", args: []string{"serve", "--mcp", "--port", "4100"}, want: "HTTP flags require --http"},
+		{name: "http with unsafe mcp flag", args: []string{"serve", "--http", "--allow-unsafe-tools"}, want: "--allow-unsafe-tools is only supported with --mcp"},
+		{name: "http no auth with token", args: []string{"serve", "--http", "--no-auth", "--auth-token", "secret"}, want: "use either --no-auth or --auth-token, not both"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			exitCode := runWithDeps(tt.args, &stdout, &stderr, appDeps{
+				getwd: func() (string, error) {
+					return t.TempDir(), nil
+				},
+			})
+			if exitCode != exitUsage {
+				t.Fatalf("exit code = %d, want %d; stderr=%q", exitCode, exitUsage, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tt.want) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveServeHTTPTokenUsesEnvironmentWithoutGenerating(t *testing.T) {
+	t.Setenv("ZERO_SERVER_TOKEN", "env-token")
+	token, generated, err := resolveServeHTTPToken(serveOptions{http: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "env-token" || generated {
+		t.Fatalf("token=%q generated=%v", token, generated)
+	}
+}
+
+func TestResolveHTTPPermissionModeRejectsSpecDraft(t *testing.T) {
+	_, err := resolveHTTPPermissionMode(httpapi.RunRequest{PermissionMode: "spec-draft"})
+	if err == nil {
+		t.Fatal("expected spec-draft to be rejected")
+	}
+}
+
+func TestHTTPSpecialistToolsUseExecAutonomyGate(t *testing.T) {
+	if shouldRegisterHTTPSpecialistTools(httpapi.RunRequest{}, "") {
+		t.Fatal("default HTTP run should not register specialist tools")
+	}
+	if !shouldRegisterHTTPSpecialistTools(httpapi.RunRequest{Autonomy: "medium"}, "") {
+		t.Fatal("medium autonomy HTTP run should register specialist tools")
 	}
 }
 
