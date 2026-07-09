@@ -223,15 +223,15 @@ func TestEventBrokerDisconnectsSlowSubscriberOnBlockingControlEvent(t *testing.T
 	}()
 
 	broker := newEventBroker()
-	ch, unsubscribe := broker.subscribe("")
+	subscription, unsubscribe := broker.subscribe("")
 	defer unsubscribe()
-	for index := 0; index < cap(ch); index++ {
+	for index := 0; index < cap(subscription.ch); index++ {
 		broker.publish(streamjson.Event{Type: streamjson.EventText})
 	}
 	broker.publish(streamjson.Event{Type: streamjson.EventPermissionRequest})
 
 	broker.mu.Lock()
-	_, stillSubscribed := broker.subscribers[ch]
+	_, stillSubscribed := broker.subscribers[subscription]
 	broker.mu.Unlock()
 	if stillSubscribed {
 		t.Fatal("slow subscriber stayed registered after blocking control event timed out")
@@ -251,7 +251,7 @@ func TestAsyncRunPanicPublishesTerminalEvents(t *testing.T) {
 			panic("boom")
 		}),
 	})
-	events, unsubscribe := server.events.subscribe("s1")
+	subscription, unsubscribe := server.events.subscribe("s1")
 	defer unsubscribe()
 
 	recorder := serveJSON(t, server, http.MethodPost, "/session/s1/prompt_async", `{"content":"go"}`)
@@ -263,7 +263,7 @@ func TestAsyncRunPanicPublishesTerminalEvents(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case event := <-events:
+		case event := <-subscription.ch:
 			if event.Type == streamjson.EventError && event.Code == "run_panic" {
 				seenError = true
 			}

@@ -17,25 +17,36 @@ import (
 
 type eventBroker struct {
 	mu          sync.Mutex
-	subscribers map[chan streamjson.Event]string
+	subscribers map[*eventSubscription]struct{}
 }
 
 var controlEventSendTimeout = 5 * time.Second
 
-func newEventBroker() *eventBroker {
-	return &eventBroker{subscribers: map[chan streamjson.Event]string{}}
+type eventSubscription struct {
+	ch        chan streamjson.Event
+	done      chan struct{}
+	sessionID string
+	once      sync.Once
 }
 
-func (broker *eventBroker) subscribe(sessionID string) (chan streamjson.Event, func()) {
-	ch := make(chan streamjson.Event, 64)
+func newEventBroker() *eventBroker {
+	return &eventBroker{subscribers: map[*eventSubscription]struct{}{}}
+}
+
+func (broker *eventBroker) subscribe(sessionID string) (*eventSubscription, func()) {
+	subscription := &eventSubscription{
+		ch:        make(chan streamjson.Event, 64),
+		done:      make(chan struct{}),
+		sessionID: strings.TrimSpace(sessionID),
+	}
 	broker.mu.Lock()
-	broker.subscribers[ch] = strings.TrimSpace(sessionID)
+	broker.subscribers[subscription] = struct{}{}
 	broker.mu.Unlock()
-	return ch, func() {
+	return subscription, func() {
 		broker.mu.Lock()
-		if _, ok := broker.subscribers[ch]; ok {
-			delete(broker.subscribers, ch)
-			close(ch)
+		if _, ok := broker.subscribers[subscription]; ok {
+			delete(broker.subscribers, subscription)
+			subscription.close()
 		}
 		broker.mu.Unlock()
 	}
@@ -43,36 +54,82 @@ func (broker *eventBroker) subscribe(sessionID string) (chan streamjson.Event, f
 
 func (broker *eventBroker) publish(event streamjson.Event) {
 	broker.mu.Lock()
-	defer broker.mu.Unlock()
-	for ch, sessionID := range broker.subscribers {
-		if sessionID != "" && event.SessionID != "" && sessionID != event.SessionID {
+	targets := make([]*eventSubscription, 0, len(broker.subscribers))
+	for subscription := range broker.subscribers {
+		if subscription.sessionID != "" && event.SessionID != "" && subscription.sessionID != event.SessionID {
 			continue
 		}
-		if isBlockingControlEvent(event) {
-			timer := time.NewTimer(controlEventSendTimeout)
-			select {
-			case ch <- event:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-			case <-timer.C:
-				delete(broker.subscribers, ch)
-				close(ch)
+		targets = append(targets, subscription)
+	}
+	broker.mu.Unlock()
+
+	controlEvent := isBlockingControlEvent(event)
+	for _, subscription := range targets {
+		if controlEvent {
+			if !subscription.sendControl(event, controlEventSendTimeout) {
+				broker.remove(subscription)
 			}
 			continue
 		}
-		select {
-		case ch <- event:
-		default:
-		}
+		subscription.trySend(event)
 	}
 }
 
 func isBlockingControlEvent(event streamjson.Event) bool {
 	return event.Type == streamjson.EventPermissionRequest || event.Type == streamjson.EventType("ask_user_request")
+}
+
+func (broker *eventBroker) remove(subscription *eventSubscription) {
+	broker.mu.Lock()
+	if _, ok := broker.subscribers[subscription]; ok {
+		delete(broker.subscribers, subscription)
+		subscription.close()
+	}
+	broker.mu.Unlock()
+}
+
+func (subscription *eventSubscription) close() {
+	subscription.once.Do(func() {
+		close(subscription.done)
+	})
+}
+
+func (subscription *eventSubscription) trySend(event streamjson.Event) {
+	select {
+	case <-subscription.done:
+		return
+	default:
+	}
+	select {
+	case <-subscription.done:
+	case subscription.ch <- event:
+	default:
+	}
+}
+
+func (subscription *eventSubscription) sendControl(event streamjson.Event, timeout time.Duration) bool {
+	select {
+	case <-subscription.done:
+		return false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+	select {
+	case <-subscription.done:
+		return false
+	case subscription.ch <- event:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 type permissionBroker struct {
@@ -273,7 +330,7 @@ func serveSSE(w http.ResponseWriter, r *http.Request, broker *eventBroker) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
-	ch, unsubscribe := broker.subscribe(sessionID)
+	subscription, unsubscribe := broker.subscribe(sessionID)
 	defer unsubscribe()
 
 	heartbeat := time.NewTicker(25 * time.Second)
@@ -282,10 +339,9 @@ func serveSSE(w http.ResponseWriter, r *http.Request, broker *eventBroker) {
 		select {
 		case <-r.Context().Done():
 			return
-		case event, ok := <-ch:
-			if !ok {
-				return
-			}
+		case <-subscription.done:
+			return
+		case event := <-subscription.ch:
 			writeSSEEvent(w, event)
 			flusher.Flush()
 		case <-heartbeat.C:

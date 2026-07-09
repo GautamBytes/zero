@@ -146,7 +146,7 @@ export interface AbortResponse extends OkResponse {
 
 export interface FileInfo {
   path: string
-  type: 'file' | 'directory' | string
+  type: 'file' | 'directory' | (string & {})
   size: number
   modTime: string
   children?: FileInfo[]
