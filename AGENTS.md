@@ -295,7 +295,7 @@ zero plugins remove github-pr-review    # alias: rm
 Marketplace catalogs are local-first. User catalogs are registered in
 `~/.config/zero/marketplaces.json`; project catalogs are registered in
 `./.zero/marketplaces.json`. Unsigned catalogs can be browsed, but adding one
-requires `--allow-unverified`, and installs require both `--yes` and
+requires `--allow-unverified`, and installing from one requires both `--yes` and
 `--allow-unverified`.
 
 A disabled managed plugin is moved to `<plugins-root>/.disabled/<id>` and its
