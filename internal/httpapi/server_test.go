@@ -293,6 +293,88 @@ func TestEventBrokerReplaysPendingControlEventsToLateSubscriber(t *testing.T) {
 	}
 }
 
+func TestAsyncRunReplaysPendingPermissionToLateSubscriber(t *testing.T) {
+	store := sessions.NewStore(sessions.StoreOptions{RootDir: t.TempDir()})
+	if _, err := store.Create(sessions.CreateInput{SessionID: "s1", Title: "One"}); err != nil {
+		t.Fatal(err)
+	}
+	server := New(Options{
+		Cwd:    t.TempDir(),
+		NoAuth: true,
+		Store:  store,
+		Runner: RunnerFunc(func(ctx context.Context, request RunRequest, hooks RunHooks) (RunResult, error) {
+			decision, err := hooks.OnPermissionRequest(ctx, agent.PermissionRequest{
+				ToolCallID:     "tool-call-id",
+				ToolName:       "bash",
+				Action:         agent.PermissionActionPrompt,
+				Permission:     "shell",
+				PermissionMode: agent.PermissionModeAsk,
+				SideEffect:     "shell",
+				Reason:         "test",
+				AvailableDecisions: []agent.PermissionDecisionAction{
+					agent.PermissionDecisionAllow,
+					agent.PermissionDecisionDeny,
+				},
+			})
+			if err != nil {
+				return RunResult{}, err
+			}
+			return RunResult{FinalAnswer: string(decision.Action)}, nil
+		}),
+	})
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	resp, err := http.Post(httpServer.URL+"/session/s1/prompt_async", "application/json", strings.NewReader(`{"content":"go"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("async status = %d", resp.StatusCode)
+	}
+
+	permissionID := waitForPendingPermission(t, server)
+	subscription, unsubscribe := server.events.subscribe("s1")
+	defer unsubscribe()
+	select {
+	case event := <-subscription.ch:
+		if event.Type != streamjson.EventPermissionRequest {
+			t.Fatalf("late event type = %q, want permission request", event.Type)
+		}
+		if event.ID != permissionID {
+			t.Fatalf("late permission id = %q, want %q", event.ID, permissionID)
+		}
+		args, ok := event.Args.(map[string]any)
+		if !ok {
+			t.Fatalf("late permission args type = %T, want map[string]any", event.Args)
+		}
+		if got := args["permissionId"]; got != permissionID {
+			t.Fatalf("late permission args id = %#v, want %q", got, permissionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("late subscriber did not receive pending permission")
+	}
+
+	resp, err = http.Post(httpServer.URL+"/session/s1/permissions/"+permissionID, "application/json", strings.NewReader(`{"action":"allow"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("permission status = %d", resp.StatusCode)
+	}
+	waitForRunEnd(t, subscription)
+
+	afterAck, unsubscribeAfterAck := server.events.subscribe("s1")
+	defer unsubscribeAfterAck()
+	select {
+	case event := <-afterAck.ch:
+		t.Fatalf("unexpected pending replay after approval: %#v", event)
+	default:
+	}
+}
+
 func TestAsyncRunPanicPublishesTerminalEvents(t *testing.T) {
 	store := sessions.NewStore(sessions.StoreOptions{RootDir: t.TempDir()})
 	if _, err := store.Create(sessions.CreateInput{SessionID: "s1", Title: "One"}); err != nil {
@@ -530,6 +612,21 @@ func waitForPendingAsk(t *testing.T, server *Server) string {
 	}
 	t.Fatal("ask request was not pending")
 	return ""
+}
+
+func waitForRunEnd(t *testing.T, subscription *eventSubscription) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-subscription.ch:
+			if event.Type == streamjson.EventRunEnd {
+				return
+			}
+		case <-deadline:
+			t.Fatal("run_end was not published")
+		}
+	}
 }
 
 func successRunner(ctx context.Context, request RunRequest, hooks RunHooks) (RunResult, error) {

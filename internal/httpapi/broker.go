@@ -238,6 +238,10 @@ func (broker *permissionBroker) request(ctx context.Context, sessionID string, r
 		if response.err != nil {
 			return agent.PermissionDecision{}, response.err
 		}
+		if ackControl != nil {
+			ackControl(id)
+			ackControl = nil
+		}
 		publish(streamjson.Event{
 			Type:           streamjson.EventPermissionDecision,
 			SessionID:      sessionID,
@@ -353,6 +357,10 @@ func (broker *askBroker) request(ctx context.Context, sessionID string, req agen
 	case response := <-ch:
 		if response.err != nil {
 			return agent.AskUserResponse{}, response.err
+		}
+		if ackControl != nil {
+			ackControl(id)
+			ackControl = nil
 		}
 		publish(streamjson.Event{
 			Type:      streamjson.EventType("ask_user_answer"),
